@@ -67,10 +67,14 @@ const HELP_TEXT = `📋 可用命令
 ━━━ 文件与工具 ━━━
 /send-me <路径>     发送本地文件给你（支持多路径、目录）
 /send-you           开始接收你发来的文件/图片
-/send-you-end [要求] 结束文件接收，将收集的文件连同要求发给 Claude
+/send-you-end [要求] 结束接收，将文件+图片连同要求发给 Claude
+/send-you-cancel    取消文件接收
 /skills [full]      列出已安装的 skill
 /<skill> [参数]     触发已安装的 skill
 /version            查看版本信息
+
+提示：/send-you 支持一次发送多张图片和多个文件，
+图片会被 Claude 直接识别，文件会被自动读取。
 
 直接输入文字即可与 Claude Code 对话`;
 

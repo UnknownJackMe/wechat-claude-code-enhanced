@@ -96,6 +96,29 @@
 
 ---
 
+### 文件互传 — `/send-me` 与 `/send-you`
+
+双向文件传输，支持多图片、多文件混合。
+
+**`/send-me` — Claude 发文件给你**
+
+- `/send-me ~/Documents/report.pdf` — 推送单个文件到微信
+- `/send-me ./chart.png ./data.csv` — 一次推送多个
+- `/send-me ~/Desktop/output/` — 推送整个目录内的可发送文件
+
+此外，Claude 在回复中提到的本地文件路径会被自动识别并推送到微信，无需手动 `/send-me`。
+
+**`/send-you` — 你发文件/图片给 Claude**
+
+- `/send-you` — 进入接收模式
+- 接着发送任意数量的图片和文件（可分多条消息发送）
+- `/send-you-end 这两张图有什么区别？` — 结束接收，把所有文件连同要求一起交给 Claude
+- `/send-you-cancel` — 取消本次接收
+
+关键点：图片以 base64 图像块的形式直接传给 Claude，**Claude 能真正"看到"图片内容**（而非仅收到一个本地路径）；文件则会被自动用 Read 工具读取。底层通过 `claude -p --input-format stream-json` 实现，修复了 `-p` 模式下 `file://` markdown 图片不可见的问题。
+
+---
+
 ## 安装
 
 ```bash
@@ -152,7 +175,10 @@ npm run daemon -- logs       # 查看日志
 ━━━ 其他 ━━━
 /cwd [路径]         查看或切换工作目录
 /prompt [内容]      查看或设置系统提示词
-/send <路径>        发送本地文件
+/send-me <路径>     发送本地文件给你（支持多路径、目录）
+/send-you           开始接收你发来的文件/图片
+/send-you-end [要求] 结束接收，将文件+图片连同要求发给 Claude
+/send-you-cancel    取消文件接收
 /skills [full]      列出已安装的 skill
 /version            查看版本信息
 ```
