@@ -424,6 +424,40 @@ export function handleResume(ctx: CommandContext, args: string): CommandResult {
     };
   }
 
+  // /resume <sessionId> — 按完整 UUID 恢复（必须先于编号判断，防止 parseInt 误解析 UUID）
+  const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (uuidRe.test(args.trim())) {
+    const target = entries.find(e => e.sessionId === args.trim());
+    if (!target) {
+      // UUID 格式正确但不在当前目录的 sessions-index 里
+      // 可能是活跃会话还未写入索引，直接信任用户输入
+      ctx.updateSession({ sdkSessionId: args.trim() });
+      return {
+        reply: [
+          `✅ 已切换到 session:`,
+          `  ${args.trim()}`,
+          '',
+          '（该 session 未在当前目录的历史索引中，已直接设置）',
+          '直接发消息即可继续该对话。',
+        ].join('\n'),
+        handled: true,
+      };
+    }
+    ctx.updateSession({ sdkSessionId: target.sessionId });
+    const label = (target.summary || target.firstPrompt || target.sessionId).slice(0, 60);
+    return {
+      reply: [
+        `✅ 已切换到历史对话`,
+        '',
+        `摘要:\n  ${label}`,
+        `时间:\n  ${new Date(target.modified).toLocaleString('zh-CN')}`,
+        '',
+        '直接发消息即可继续该对话。',
+      ].join('\n'),
+      handled: true,
+    };
+  }
+
   // /resume <编号> — 按编号恢复
   const num = parseInt(args.trim(), 10);
   if (!isNaN(num) && num >= 1 && num <= entries.length) {
@@ -443,20 +477,35 @@ export function handleResume(ctx: CommandContext, args: string): CommandResult {
     };
   }
 
-  // /resume <sessionId> — 按完整 UUID 恢复
-  const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-  if (uuidRe.test(args.trim())) {
-    const target = entries.find(e => e.sessionId === args.trim());
-    if (!target) {
-      return { reply: `未找到 sessionId: ${args.trim()}`, handled: true };
-    }
+  // /resume <关键词> — 按自定义名称或首条消息模糊搜索
+  const keyword = args.trim().toLowerCase().replace(/^["']|["']$/g, '');
+  const matched = entries.filter(e => {
+    const { customTitle, firstUserMessage } = extractSessionInfo(e.fullPath);
+    const haystack = [customTitle, firstUserMessage, e.summary].filter(Boolean).join(' ').toLowerCase();
+    return haystack.includes(keyword);
+  });
+
+  if (matched.length === 0) {
+    return {
+      reply: [
+        `未找到包含 "${args.trim()}" 的历史对话。`,
+        '',
+        '可以用 /resume 列出所有对话，再用编号恢复。',
+      ].join('\n'),
+      handled: true,
+    };
+  }
+
+  if (matched.length === 1) {
+    const target = matched[0];
+    const { customTitle, firstUserMessage } = extractSessionInfo(target.fullPath);
+    const label = (customTitle || firstUserMessage || target.summary || target.sessionId).slice(0, 60);
     ctx.updateSession({ sdkSessionId: target.sessionId });
-    const label = (target.summary || target.firstPrompt || target.sessionId).slice(0, 60);
     return {
       reply: [
         `✅ 已切换到历史对话`,
         '',
-        `摘要:\n  ${label}`,
+        `名称:\n  ${label}`,
         `时间:\n  ${new Date(target.modified).toLocaleString('zh-CN')}`,
         '',
         '直接发消息即可继续该对话。',
@@ -465,8 +514,22 @@ export function handleResume(ctx: CommandContext, args: string): CommandResult {
     };
   }
 
+  // 多个匹配，列出让用户选择
+  const lines = matched.slice(0, 10).map((e, i) => {
+    const { customTitle, firstUserMessage } = extractSessionInfo(e.fullPath);
+    const label = (customTitle || firstUserMessage || e.summary || '（无内容）')
+      .replace(/<[^>]+>[\s\S]*?<\/[^>]+>/g, '').replace(/<[^>]+>/g, '').trim().slice(0, 50);
+    const modified = new Date(e.modified).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' });
+    return `${i + 1}. [${modified}] ${label}`;
+  });
   return {
-    reply: `用法:\n  /resume          列出历史对话\n  /resume <编号>   恢复指定对话（编号来自列表）`,
+    reply: [
+      `找到 ${matched.length} 条匹配 "${args.trim()}" 的对话：`,
+      '',
+      ...lines,
+      '',
+      '请用 /resume <编号> 选择，编号对应上方列表。',
+    ].join('\n'),
     handled: true,
   };
 }
