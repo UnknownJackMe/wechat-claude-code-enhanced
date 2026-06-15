@@ -1,0 +1,166 @@
+# WeChat Claude Code Bridge — Enhanced
+
+<p align="center">
+  <strong>在微信中与本地 Claude Code 对话，并获得更强大的会话管理能力</strong>
+</p>
+
+<p align="center">
+  <a href="https://github.com/Wechat-ggGitHub/wechat-claude-code"><img src="https://img.shields.io/badge/基于-wechat--claude--code-orange?style=flat-square" alt="Based on wechat-claude-code"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License: MIT"></a>
+</p>
+
+本项目基于 [Wechat-ggGitHub/wechat-claude-code](https://github.com/Wechat-ggGitHub/wechat-claude-code) 的源代码进行增强，在保留原有全部功能的基础上，新增了历史对话恢复、原生上下文压缩、思考强度调节、Advisor 模型、目标驱动循环、定时任务、Workspace 配置文件等功能。
+
+---
+
+## 新增功能一览
+
+### `/resume` — 历史对话恢复
+
+直接在微信中浏览和恢复历史对话，无需手动查找 session ID。
+
+- `/resume` — 列出当前目录最近 15 条历史对话，显示自定义名称（`/rename` 设置的）或首条用户消息
+- `/resume 2` — 恢复列表中第 2 条对话
+- `/resume <uuid>` — 通过完整 session ID 恢复
+
+显示逻辑与 Claude Code 终端内的 `/resume` 选择器保持一致：优先显示 `/rename` 设置的自定义标题，其次是第一条真实用户消息。同时支持只有单个 session 的目录（原版会报"没有历史对话"）。
+
+---
+
+### `/compact` — 原生上下文压缩
+
+原版 `/compact` 只是清除 session ID（等同于 `/clear`）。本增强版调用 `claude -p /compact --resume <sessionId>`，触发 Claude Code 的**原生压缩机制**：
+
+- 对话在原 session 内被总结压缩，**session ID 保持不变**
+- token 用量大幅下降（实测：177k → 7k tokens，减少约 96%）
+- 压缩完成后推送到微信，显示压缩前后 token 数量
+
+---
+
+### `/effort` — 思考强度调节
+
+调整 Claude 的推理深度，在速度与质量之间按需切换。
+
+- `/effort` — 查看当前级别和可选项
+- `/effort xhigh` — 切换到指定级别
+- 支持：`low` / `medium` / `high` / `xhigh` / `max`
+
+---
+
+### `/advisor` — Advisor 模型
+
+为主模型配置一个更强的顾问模型，在关键决策点自动介入（需要 Claude Code v2.1.170+）。
+
+- `/advisor opus` — 启用 Opus 作为顾问
+- `/advisor off` — 关闭
+- 支持：`opus` / `sonnet` / `fable` / 完整 model ID
+
+---
+
+### `/goal` — 目标驱动循环
+
+让 Claude 持续工作直到满足指定条件。
+
+- `/goal 所有单元测试通过且 lint 干净` — 设置目标，Claude 自动循环
+- `/goal` — 查看当前目标状态
+- `/goal clear` — 提前终止
+
+---
+
+### `/loop` — 定时循环任务
+
+在 wechat bot 进程内实现定时任务，结果自动推送到微信。
+
+- `/loop 5m 检查 CI 是否通过` — 每 5 分钟执行一次
+- `/loop` — 查看所有运行中的 loop
+- `/loop stop <id>` — 停止指定 loop
+
+支持间隔：`30s`（最小提升至 1 分钟）/ `5m` / `2h` / `1d`。Loop 持久化，daemon 重启后自动恢复，7 天自动过期。
+
+---
+
+### Workspace 配置文件
+
+针对多项目场景，一键切换目录、模型、思考强度和历史对话。
+
+- `/set-config 0` — 向导式创建配置（分步输入名称、目录、模型、session ID）
+- `/configs` — 列出所有配置
+- `/switch-config 0` — 一键切换
+- `/delete-config 0` — 删除配置
+
+---
+
+### `/status` 增强
+
+显示当前是否处于某个 workspace 配置中，所有字段分行清晰展示。
+
+---
+
+## 安装
+
+```bash
+git clone https://github.com/UnknownJackMe/wechat-claude-code-enhanced.git ~/.claude/skills/wechat-claude-code
+cd ~/.claude/skills/wechat-claude-code && npm install
+```
+
+首次扫码绑定及 daemon 管理，参考原项目文档：
+
+```bash
+npm run setup                # 首次扫码绑定
+npm run daemon -- start      # 启动守护进程（开机自启，崩溃自动重启）
+npm run daemon -- status     # 查看运行状态
+npm run daemon -- logs       # 查看日志
+```
+
+## 完整命令列表
+
+```
+━━━ 会话管理 ━━━
+/help               显示帮助
+/status             查看当前会话状态
+/clear              清除当前会话
+/reset              完全重置
+/stop               停止当前对话
+/compact            压缩上下文（保持 session ID）
+/history [数量]     查看对话记录
+/undo [数量]        撤销最近对话
+
+━━━ 对话恢复 ━━━
+/resume             列出当前目录的历史对话
+/resume <编号>      恢复指定编号的历史对话
+/resume <uuid>      通过 session ID 恢复
+
+━━━ 模型配置 ━━━
+/model [名称]       查看或切换模型
+/effort [级别]      查看或调整思考强度（low/medium/high/xhigh/max）
+/advisor [模型]     查看或设置 Advisor 模型（opus/sonnet/fable/off）
+
+━━━ 任务控制 ━━━
+/goal [条件]        设置目标，Claude 持续工作直到条件满足
+/goal clear         清除当前目标
+/loop <间隔> <提示> 定时循环执行，例: /loop 5m 检查 CI
+/loop               列出所有运行中的 loop
+/loop stop <id>     停止指定 loop
+/loop stop all      停止所有 loop
+
+━━━ Workspace 配置 ━━━
+/configs                  列出所有 workspace 配置
+/set-config <编号>        向导式创建/编辑配置
+/switch-config <编号>     一键切换（目录+模型+session）
+/delete-config <编号>     删除配置
+
+━━━ 其他 ━━━
+/cwd [路径]         查看或切换工作目录
+/prompt [内容]      查看或设置系统提示词
+/send <路径>        发送本地文件
+/skills [full]      列出已安装的 skill
+/version            查看版本信息
+```
+
+## 致谢
+
+本项目基于 [wechat-claude-code](https://github.com/Wechat-ggGitHub/wechat-claude-code)（MIT License）进行二次开发，感谢原作者的出色工作。
+
+## License
+
+MIT
