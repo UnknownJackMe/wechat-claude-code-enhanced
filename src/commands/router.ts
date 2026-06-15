@@ -1,7 +1,7 @@
 import type { Session } from '../session.js';
 import { findSkill } from '../claude/skill-scanner.js';
 import { logger } from '../logger.js';
-import { handleHelp, handleClear, handleCwd, handleModel, handleStatus, handleSkills, handleHistory, handleReset, handleCompact, handleUndo, handleVersion, handlePrompt, handleSend, handleResume, handleEffort, handleAdvisor, handleGoal, handleLoop, handleConfigs, handleSwitchConfig, handleSetConfig, handleDeleteConfig, handleSetupWizard, handleUnknown } from './handlers.js';
+import { handleHelp, handleClear, handleCwd, handleModel, handleStatus, handleSkills, handleHistory, handleReset, handleCompact, handleUndo, handleVersion, handlePrompt, handleSend, handleSendMe, handleSendYou, handleSendYouCancel, handleSendYouEnd, handleResume, handleEffort, handleAdvisor, handleGoal, handleLoop, handleConfigs, handleSwitchConfig, handleSetConfig, handleDeleteConfig, handleSetupWizard, handleUnknown } from './handlers.js';
 
 export interface CommandContext {
   accountId: string;
@@ -17,8 +17,13 @@ export interface CommandResult {
   handled: boolean;
   claudePrompt?: string;
   sendFile?: string;
+  sendFiles?: string[];
   compactSession?: boolean;
   startLoop?: { prompt: string; intervalMs: number };
+  sendYouPayload?: {
+    requirement: string;
+    items: Array<{ localPath: string; fileName: string; type: 'image' | 'file' }>;
+  };
 }
 
 /**
@@ -88,6 +93,14 @@ export function routeCommand(ctx: CommandContext): CommandResult {
       return handleDeleteConfig(ctx, args);
     case 'send':
       return handleSend(ctx, args);
+    case 'send-me':
+      return handleSendMe(ctx, args);
+    case 'send-you':
+      return handleSendYou(ctx, args);
+    case 'send-you-cancel':
+      return handleSendYouCancel(ctx);
+    case 'send-you-end':
+      return handleSendYouEnd(ctx, args);
     case 'version':
     case 'v':
       return handleVersion();

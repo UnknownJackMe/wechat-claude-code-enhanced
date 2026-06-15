@@ -135,3 +135,38 @@ export async function downloadFile(item: MessageItem): Promise<string | null> {
     return null;
   }
 }
+
+/**
+ * Download all images and files from a message's item_list.
+ * Returns an array of { localPath, fileName, type } for each successfully downloaded item.
+ */
+export async function downloadAllMedia(
+  items: MessageItem[],
+): Promise<Array<{ localPath: string; fileName: string; type: 'image' | 'file' }>> {
+  const results: Array<{ localPath: string; fileName: string; type: 'image' | 'file' }> = [];
+  const tmpDir = path.join(os.tmpdir(), 'wechat-claude-uploads');
+  fs.mkdirSync(tmpDir, { recursive: true });
+
+  for (const item of items) {
+    if (item.type === MessageItemType.IMAGE) {
+      const dataUri = await downloadImage(item);
+      if (dataUri) {
+        const matches = dataUri.match(/^data:([^;]+);base64,(.+)$/);
+        if (matches) {
+          const ext = matches[1].split('/')[1] || 'jpg';
+          const fileName = `image-${Date.now()}-${Math.random().toString(36).slice(2, 6)}.${ext}`;
+          const localPath = path.join(tmpDir, fileName);
+          fs.writeFileSync(localPath, Buffer.from(matches[2], 'base64'));
+          results.push({ localPath, fileName, type: 'image' });
+        }
+      }
+    } else if (item.type === MessageItemType.FILE) {
+      const localPath = await downloadFile(item);
+      if (localPath) {
+        const fileName = item.file_item?.file_name || path.basename(localPath);
+        results.push({ localPath, fileName, type: 'file' });
+      }
+    }
+  }
+  return results;
+}

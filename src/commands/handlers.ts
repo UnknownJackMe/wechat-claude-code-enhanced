@@ -18,7 +18,7 @@ import {
   removeLoop,
   removeAllLoops,
 } from '../loop-registry.js';
-import { resolve, basename, join } from 'node:path';
+import { resolve, basename, join, extname } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 
@@ -65,7 +65,9 @@ const HELP_TEXT = `📋 可用命令
 /prompt [内容]      查看或设置系统提示词（全局生效）
 
 ━━━ 文件与工具 ━━━
-/send <路径>        发送本地文件（图片直接显示）
+/send-me <路径>     发送本地文件给你（支持多路径、目录）
+/send-you           开始接收你发来的文件/图片
+/send-you-end [要求] 结束文件接收，将收集的文件连同要求发给 Claude
 /skills [full]      列出已安装的 skill
 /<skill> [参数]     触发已安装的 skill
 /version            查看版本信息
@@ -245,26 +247,121 @@ export function handlePrompt(_ctx: CommandContext, args: string): CommandResult 
 
 export function handleSend(ctx: CommandContext, args: string): CommandResult {
   if (!args) {
-    return { reply: '用法: /send <文件路径>\n例: /send ~/Documents/report.pdf\n     /send ./chart.png', handled: true };
+    return {
+      reply: [
+        '用法: /send <路径> [路径2] ...',
+        '支持单文件、多文件（空格分隔）、目录（发送目录内所有文件）',
+        '',
+        '例:',
+        '  /send ~/Documents/report.pdf',
+        '  /send ./chart.png ./data.csv',
+        '  /send ~/Desktop/output/',
+      ].join('\n'),
+      handled: true,
+    };
   }
 
-  const resolved = args.startsWith('/')
-    ? args
-    : resolve(ctx.session.workingDirectory, args.replace(/^~/, homedir()));
-  if (!existsSync(resolved)) {
-    return { reply: `文件不存在: ${resolved}`, handled: true };
+  // 解析多路径（按空格分隔，支持路径含空格则需引号，但简单情况不需要）
+  const rawPaths = args.match(/"[^"]+"|'[^']+'|\S+/g) || [];
+  const resolved = rawPaths.map(p => {
+    const clean = p.replace(/^["']|["']$/g, '');
+    if (clean.startsWith('/')) return clean;
+    return resolve(ctx.session.workingDirectory, clean.replace(/^~/, homedir()));
+  });
+
+  const notFound = resolved.filter(p => !existsSync(p));
+  if (notFound.length > 0) {
+    return { reply: `文件不存在:\n${notFound.map(p => '  ' + p).join('\n')}`, handled: true };
   }
 
-  const stat = statSync(resolved);
-  if (stat.isDirectory()) {
-    return { reply: `这是一个目录，请指定文件: ${resolved}`, handled: true };
+  // 展开目录
+  const files: string[] = [];
+  const SENDABLE = new Set([
+    '.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg', '.ico',
+    '.pdf', '.doc', '.docx', '.ppt', '.pptx', '.rtf',
+    '.txt', '.md', '.csv', '.xlsx', '.xls',
+    '.mp3', '.wav', '.m4a', '.mp4', '.mov',
+    '.zip', '.tar', '.gz', '.json', '.ts', '.js', '.py',
+  ]);
+  for (const p of resolved) {
+    const st = statSync(p);
+    if (st.isDirectory()) {
+      const entries = readdirSync(p);
+      const dirFiles = entries
+        .map(e => `${p}/${e}`)
+        .filter(f => { try { return statSync(f).isFile() && SENDABLE.has(extname(f).toLowerCase()); } catch { return false; } });
+      if (dirFiles.length === 0) {
+        return { reply: `目录为空或没有可发送的文件: ${p}`, handled: true };
+      }
+      files.push(...dirFiles);
+    } else {
+      if (st.size > 25 * 1024 * 1024) {
+        return { reply: `文件过大 (${(st.size / 1024 / 1024).toFixed(1)}MB)，最大支持 25MB:\n  ${p}`, handled: true };
+      }
+      files.push(p);
+    }
   }
 
-  if (stat.size > 25 * 1024 * 1024) {
-    return { reply: `文件过大 (${(stat.size / 1024 / 1024).toFixed(1)}MB)，最大支持 25MB`, handled: true };
+  if (files.length === 1) {
+    return { handled: true, sendFile: files[0] };
+  }
+  return { handled: true, sendFiles: files };
+}
+
+/** /send-me — 别名，功能同 /send */
+export function handleSendMe(ctx: CommandContext, args: string): CommandResult {
+  return handleSend(ctx, args);
+}
+
+/** /send-you — 进入文件接收模式 */
+export function handleSendYou(ctx: CommandContext, _args: string): CommandResult {
+  ctx.updateSession({
+    pendingFileUpload: { items: [], startedAt: Date.now() },
+  });
+  return {
+    reply: [
+      '📥 准备接收文件',
+      '',
+      '请直接发送图片或文件（可多次发送）。',
+      '发完后请发：/send-you-end [对这些文件的要求]',
+      '',
+      '发送 /send-you-cancel 取消。',
+    ].join('\n'),
+    handled: true,
+  };
+}
+
+/** /send-you-cancel — 取消文件接收 */
+export function handleSendYouCancel(ctx: CommandContext): CommandResult {
+  if (!ctx.session.pendingFileUpload) {
+    return { reply: '当前没有进行中的文件接收。', handled: true };
+  }
+  const count = ctx.session.pendingFileUpload.items.length;
+  ctx.updateSession({ pendingFileUpload: undefined });
+  return { reply: `已取消文件接收（已丢弃 ${count} 个文件）。`, handled: true };
+}
+
+/** /send-you-end — 结束文件接收，整合发给 Claude */
+export function handleSendYouEnd(ctx: CommandContext, args: string): CommandResult {
+  const upload = ctx.session.pendingFileUpload;
+  if (!upload) {
+    return { reply: '当前没有进行中的文件接收，请先发 /send-you 开始。', handled: true };
+  }
+  if (upload.items.length === 0) {
+    ctx.updateSession({ pendingFileUpload: undefined });
+    return { reply: '没有收到任何文件，已取消。', handled: true };
   }
 
-  return { handled: true, sendFile: resolved };
+  const requirement = args.trim();
+
+  ctx.updateSession({ pendingFileUpload: undefined });
+  return {
+    handled: true,
+    sendYouPayload: {
+      requirement,
+      items: upload.items,
+    },
+  };
 }
 
 interface SessionIndexEntry {

@@ -3,21 +3,21 @@ import process from 'node:process';
 import { spawnSync } from 'node:child_process';
 import { join, basename } from 'node:path';
 import { unlinkSync, writeFileSync, mkdirSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 
 import { WeChatApi } from './wechat/api.js';
 import { saveAccount, loadLatestAccount, type AccountData } from './wechat/accounts.js';
 import { startQrLogin, waitForQrScan } from './wechat/login.js';
 import { createMonitor, type MonitorCallbacks } from './wechat/monitor.js';
 import { createSender } from './wechat/send.js';
-import { downloadImage, extractText, extractFirstImageUrl, extractFirstFileItem, downloadFile } from './wechat/media.js';
+import { downloadImage, extractText, extractFirstImageUrl, extractFirstFileItem, downloadFile, downloadAllMedia } from './wechat/media.js';
 import { createSessionStore, type Session } from './session.js';
 import { routeCommand, handleSetupWizard, type CommandContext, type CommandResult } from './commands/router.js';
 import { claudeQuery, type QueryOptions } from './claude/provider.js';
 import { loadConfig, saveConfig } from './config.js';
 import { logger } from './logger.js';
 import { DATA_DIR } from './constants.js';
-import { MessageType, type WeixinMessage } from './wechat/types.js';
+import { MessageType, MessageItemType, type WeixinMessage } from './wechat/types.js';
 import {
   loadLoops, addLoop, removeLoop, updateNextFire, getLoopsForAccount,
   type LoopEntry, formatInterval,
@@ -45,20 +45,23 @@ const AUTO_PUSH_EXTENSIONS = new Set([
   '.mp3', '.wav', '.m4a', '.mp4', '.mov',
 ]);
 
-/** Extract local file paths from Claude's response text. */
+/** Extract local file paths from Claude's response text (files and directories). */
 function extractFilePathsFromText(text: string, cwd: string): string[] {
   const paths: string[] = [];
-  // Match absolute paths (macOS/Linux), tilde paths, and Windows paths with a file extension
-  const regex = /(?:\/(?:Users|home|tmp|var|etc)\/[^\s`'"()\[\]{}|<>]+\.\w+|~\/[^\s`'"()\[\]{}|<>]+\.\w+|[A-Za-z]:[\\\/][^\s`'"()\[\]{}|<>]+\.\w+)/g;
+  // Match absolute paths with extension (files) or trailing slash / no extension (dirs)
+  const regex = /(?:\/(?:Users|home|tmp|var|etc|opt)\/[^\s`'"()\[\]{}|<>]+)/g;
   let match: RegExpExecArray | null;
   while ((match = regex.exec(text)) !== null) {
-    const raw = match[0];
-    const resolved = raw.startsWith('~')
-      ? raw.replace(/^~/, homedir())
-      : raw;
+    const raw = match[0].replace(/[,。、]+$/, ''); // strip trailing punctuation
+    const resolved = raw.startsWith('~') ? raw.replace(/^~/, homedir()) : raw;
     paths.push(resolved);
   }
-  return paths;
+  // Also match tilde paths
+  const tildeRegex = /~\/[^\s`'"()\[\]{}|<>]+/g;
+  while ((match = tildeRegex.exec(text)) !== null) {
+    paths.push(match[0].replace(/^~/, homedir()).replace(/[,。、]+$/, ''));
+  }
+  return [...new Set(paths)]; // deduplicate
 }
 
 /** Split text into blocks at paragraph boundaries (double newlines). */
@@ -449,6 +452,56 @@ async function handleMessage(
     }
   }
 
+  // -- File upload collection mode --
+
+  if (session.pendingFileUpload) {
+    const updateSession = (partial: Partial<Session>) => {
+      Object.assign(session, partial);
+      sessionStore.save(account.accountId, session);
+    };
+
+    // Allow /send-you-end, /send-you-cancel, /send-you to pass through to command routing
+    const passThroughCmds = ['/send-you-end', '/send-you-cancel', '/send-you'];
+    const isPassThrough = passThroughCmds.some(cmd => userText.trim().toLowerCase().startsWith(cmd));
+
+    if (!isPassThrough) {
+      // Check if message has media
+      const hasMedia = msg.item_list?.some(
+        item => item.type === MessageItemType.IMAGE || item.type === MessageItemType.FILE
+      );
+
+      if (hasMedia && msg.item_list) {
+        // Download all media in this message
+        const downloaded = await downloadAllMedia(msg.item_list);
+        if (downloaded.length > 0) {
+          const existing = session.pendingFileUpload.items;
+          updateSession({
+            pendingFileUpload: {
+              ...session.pendingFileUpload,
+              items: [...existing, ...downloaded],
+            },
+          });
+          const total = session.pendingFileUpload.items.length;
+          const names = downloaded.map(f => f.fileName).join('、');
+          await sender.sendText(fromUserId, contextToken,
+            `✅ 已接收: ${names}（共 ${total} 个文件）\n\n继续发送文件，或发 /send-you-end [要求] 完成。`
+          );
+        } else {
+          await sender.sendText(fromUserId, contextToken, '⚠️ 文件下载失败，请重试。');
+        }
+        return;
+      }
+
+      if (userText && !userText.startsWith('/')) {
+        // Non-command text during collection — remind user
+        await sender.sendText(fromUserId, contextToken,
+          `📥 文件接收中（已收 ${session.pendingFileUpload.items.length} 个）\n\n请继续发送文件，或发 /send-you-end [要求] 完成，/send-you-cancel 取消。`
+        );
+        return;
+      }
+    }
+  }
+
   // -- Command routing --
 
   if (userText.startsWith('/')) {
@@ -491,6 +544,59 @@ async function handleMessage(
 
     if (result.handled && result.sendFile) {
       await sender.sendFile(fromUserId, contextToken, result.sendFile);
+      return;
+    }
+
+    if (result.handled && result.sendFiles && result.sendFiles.length > 0) {
+      await sender.sendText(fromUserId, contextToken, `📎 准备发送 ${result.sendFiles.length} 个文件...`);
+      const { sent, failed } = await sender.sendFiles(fromUserId, contextToken, result.sendFiles);
+      if (failed.length > 0) {
+        await sender.sendText(fromUserId, contextToken,
+          `✅ 已发送 ${sent} 个文件，以下 ${failed.length} 个发送失败:\n${failed.map(f => '  ' + f).join('\n')}`
+        );
+      }
+      return;
+    }
+
+    if (result.handled && result.sendYouPayload) {
+      const { requirement, items } = result.sendYouPayload;
+      const { readFileSync } = await import('node:fs');
+      const { extname } = await import('node:path');
+
+      const mimeByExt: Record<string, string> = {
+        '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+        '.gif': 'image/gif', '.webp': 'image/webp', '.bmp': 'image/bmp',
+      };
+
+      const collectedImages: QueryOptions['images'] = [];
+      const collectedFilePaths: string[] = [];
+      for (const it of items) {
+        if (it.type === 'image') {
+          try {
+            const buf = readFileSync(it.localPath);
+            const ext = extname(it.localPath).toLowerCase();
+            collectedImages.push({
+              type: 'image',
+              source: {
+                type: 'base64',
+                media_type: mimeByExt[ext] ?? 'image/jpeg',
+                data: buf.toString('base64'),
+              },
+            });
+          } catch (err) {
+            logger.warn('Failed to read collected image', { path: it.localPath, error: err instanceof Error ? err.message : String(err) });
+            collectedFilePaths.push(it.localPath);
+          }
+        } else {
+          collectedFilePaths.push(it.localPath);
+        }
+      }
+
+      await sendToClaude(
+        requirement || '请分析以下文件/图片。', undefined, undefined, fromUserId, contextToken,
+        account, session, sessionStore, sender, config, activeControllers,
+        { images: collectedImages, filePaths: collectedFilePaths },
+      );
       return;
     }
 
@@ -609,6 +715,10 @@ async function sendToClaude(
   sender: ReturnType<typeof createSender>,
   config: ReturnType<typeof loadConfig>,
   activeControllers: Map<string, AbortController>,
+  preCollected?: {
+    images?: QueryOptions['images'];
+    filePaths?: string[];
+  },
 ): Promise<void> {
   // Set state to processing
   session.state = 'processing';
@@ -658,6 +768,19 @@ async function sendToClaude(
         prompt = userText
           ? `${userText}\n\n用户发送了文件: ${fileName}\n文件已保存到: ${filePath}\n请先读取这个文件再回答。`
           : `用户发送了文件: ${fileName}\n文件已保存到: ${filePath}\n请读取这个文件并总结其内容。`;
+      }
+    }
+
+    // Merge pre-collected media from /send-you flow
+    if (preCollected) {
+      if (preCollected.images && preCollected.images.length > 0) {
+        images = [...(images ?? []), ...preCollected.images];
+      }
+      if (preCollected.filePaths && preCollected.filePaths.length > 0) {
+        const fileLines = preCollected.filePaths
+          .map((p) => `  ${p}`)
+          .join('\n');
+        prompt = `${prompt}\n\n用户发送了以下文件，请用 Read 工具读取后再回答：\n${fileLines}`;
       }
     }
 
@@ -726,6 +849,10 @@ async function sendToClaude(
       model: session.model,
       effort: session.effort,
       advisor: session.advisor,
+      addDirs: [
+        join(tmpdir(), 'wechat-claude-uploads'),
+        join(tmpdir(), 'wechat-claude-code'),
+      ],
       systemPrompt: [
         '你正在通过微信与用户对话，不是在终端里。不要让用户去终端操作。如果用户需要文件，直接输出文件地址就行，会自动识别解析推送文件到用户的微信中。',
         config.systemPrompt,
@@ -796,43 +923,36 @@ async function sendToClaude(
     if (result.text) {
       const cwd = (session.workingDirectory || config.workingDirectory).replace(/^~/, homedir());
       const detectedPaths = extractFilePathsFromText(result.text, cwd);
-      const { existsSync } = await import('node:fs');
-      const { extname } = await import('node:path');
-      const pushable = detectedPaths.filter(f => {
-        const ext = extname(f).toLowerCase();
-        return AUTO_PUSH_EXTENSIONS.has(ext) && existsSync(f);
-      });
-      if (pushable.length > 0) {
-        const failedFiles: string[] = [];
-        for (const filePath of pushable) {
+      const { existsSync, statSync: fstatSync, readdirSync: freaddirSync } = await import('node:fs');
+      const { extname: fextname } = await import('node:path');
+
+      // Expand directories and filter by extension
+      const pushable: string[] = [];
+      for (const p of detectedPaths) {
+        if (!existsSync(p)) continue;
+        const st = fstatSync(p);
+        if (st.isDirectory()) {
+          // Scan directory for sendable files
           try {
-            await sender.sendFile(fromUserId, contextToken, filePath);
-          } catch {
-            failedFiles.push(filePath);
-          }
-        }
-        if (failedFiles.length > 0) {
-          // Server-side rate limit requires longer cooldown (observed ret:-2 even after 9s backoff)
-          for (let attempt = 0; attempt < 3; attempt++) {
-            const delay = (attempt + 1) * 15_000;
-            logger.warn(`Rate-limited, retrying ${failedFiles.length} file(s) in ${delay / 1000}s (attempt ${attempt + 1}/3)`);
-            await new Promise(r => setTimeout(r, delay));
-            const stillFailed: string[] = [];
-            for (const filePath of failedFiles) {
-              try {
-                await sender.sendFile(fromUserId, contextToken, filePath);
-              } catch {
-                stillFailed.push(filePath);
+            for (const entry of freaddirSync(p)) {
+              const full = `${p}/${entry}`;
+              const ext = fextname(entry).toLowerCase();
+              if (AUTO_PUSH_EXTENSIONS.has(ext) && existsSync(full) && fstatSync(full).isFile()) {
+                pushable.push(full);
               }
             }
-            if (stillFailed.length === 0) break;
-            failedFiles.length = 0;
-            failedFiles.push(...stillFailed);
-          }
-          if (failedFiles.length > 0) {
-            logger.error('File delivery failed after all retries', { files: failedFiles });
-            await sender.sendText(fromUserId, contextToken, `文件推送失败（服务端限频），请稍后重试。`).catch(() => {});
-          }
+          } catch { /* skip unreadable dirs */ }
+        } else if (st.isFile()) {
+          const ext = fextname(p).toLowerCase();
+          if (AUTO_PUSH_EXTENSIONS.has(ext)) pushable.push(p);
+        }
+      }
+
+      if (pushable.length > 0) {
+        const { sent, failed: failedFiles } = await sender.sendFiles(fromUserId, contextToken, pushable);
+        if (failedFiles.length > 0) {
+          logger.error('File delivery failed after retries', { files: failedFiles });
+          await sender.sendText(fromUserId, contextToken, `文件推送失败（服务端限频），请稍后重试。`).catch(() => {});
         }
       }
     }

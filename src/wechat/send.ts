@@ -1,5 +1,6 @@
-import { existsSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { existsSync, readdirSync, statSync } from 'node:fs';
+import { resolve, extname } from 'node:path';
+import { isImageFile } from './upload.js';
 import { WeChatApi } from './api.js';
 import { MessageItemType, MessageType, MessageState, TypingStatus, type MessageItem, type OutboundMessage } from './types.js';
 import { uploadFile } from './upload.js';
@@ -180,5 +181,78 @@ export function createSender(api: WeChatApi, botAccountId: string) {
     }
   }
 
-  return { sendText, startTyping, sendFile };
+  /**
+   * Send multiple files with rate-limit retry logic.
+   * Returns { sent, failed } counts.
+   */
+  async function sendFiles(
+    toUserId: string,
+    contextToken: string,
+    filePaths: string[],
+  ): Promise<{ sent: number; failed: string[] }> {
+    const failed: string[] = [];
+    let sent = 0;
+
+    for (const filePath of filePaths) {
+      try {
+        await sendFile(toUserId, contextToken, filePath);
+        sent++;
+        // Small gap between files to avoid rate limits
+        if (filePaths.length > 1) await new Promise(r => setTimeout(r, 500));
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.includes('rate-limited')) {
+          // Back off and retry once
+          await new Promise(r => setTimeout(r, 15_000));
+          try {
+            await sendFile(toUserId, contextToken, filePath);
+            sent++;
+          } catch {
+            failed.push(filePath);
+          }
+        } else {
+          failed.push(filePath);
+        }
+      }
+    }
+
+    return { sent, failed };
+  }
+
+  return { sendText, startTyping, sendFile, sendFiles };
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+const SENDABLE_EXTENSIONS = new Set([
+  '.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg', '.ico',
+  '.pdf', '.doc', '.docx', '.ppt', '.pptx', '.rtf',
+  '.txt', '.md', '.csv', '.xlsx', '.xls',
+  '.mp3', '.wav', '.m4a', '.mp4', '.mov',
+  '.zip', '.tar', '.gz', '.json', '.ts', '.js', '.py',
+]);
+
+/** Expand a list of paths: directories are scanned (non-recursive), files are kept as-is. */
+export function expandPaths(paths: string[]): string[] {
+  const result: string[] = [];
+  for (const p of paths) {
+    if (!existsSync(p)) continue;
+    const st = statSync(p);
+    if (st.isDirectory()) {
+      for (const entry of readdirSync(p)) {
+        const full = `${p}/${entry}`;
+        try {
+          const est = statSync(full);
+          if (est.isFile() && SENDABLE_EXTENSIONS.has(extname(entry).toLowerCase())) {
+            result.push(full);
+          }
+        } catch { /* skip */ }
+      }
+    } else if (st.isFile()) {
+      result.push(p);
+    }
+  }
+  return result;
 }

@@ -41,6 +41,7 @@ export interface QueryOptions {
   model?: string;
   effort?: string;
   advisor?: string;
+  addDirs?: string[];
   systemPrompt?: string;
   images?: Array<{
     type: "image";
@@ -97,6 +98,7 @@ export async function claudeQuery(options: QueryOptions): Promise<QueryResult> {
     model,
     effort,
     advisor,
+    addDirs,
     systemPrompt,
     images,
     onText,
@@ -114,7 +116,8 @@ export async function claudeQuery(options: QueryOptions): Promise<QueryResult> {
 
   // Build CLI arguments
   const args: string[] = [
-    '-p', '-',
+    '-p',
+    '--input-format', 'stream-json',
     '--output-format', 'stream-json',
     '--verbose',
     '--include-partial-messages',
@@ -126,15 +129,22 @@ export async function claudeQuery(options: QueryOptions): Promise<QueryResult> {
   if (effort) args.push('--effort', effort);
   // --advisor requires v2.1.170+ (server-side tool, not available on older builds)
   if (advisor && versionAtLeast(2, 1, 170)) args.push('--advisor', advisor);
+  if (addDirs && addDirs.length > 0) args.push('--add-dir', ...addDirs);
   if (systemPrompt) args.push('--append-system-prompt', systemPrompt);
 
-  // Handle images: save to temp files and append paths to prompt
-  const tempImagePaths = images?.length ? saveImageTemp(images) : [];
-  let fullPrompt = prompt;
-  if (tempImagePaths.length > 0) {
-    const imageLines = tempImagePaths.map(p => `\n![image](file://${p})`).join('');
-    fullPrompt += imageLines;
+  // Build stream-json user message (supports text + images)
+  const contentBlocks: any[] = [{ type: 'text', text: prompt }];
+  if (images && images.length > 0) {
+    for (const img of images) {
+      contentBlocks.push(img);
+    }
   }
+  const streamJsonMessage = JSON.stringify({
+    type: 'user',
+    message: { role: 'user', content: contentBlocks },
+  });
+
+  const tempImagePaths: string[] = []; // kept for cleanup compat, no longer used for images
 
   // Accumulators
   let sessionId = '';
@@ -165,8 +175,8 @@ export async function claudeQuery(options: QueryOptions): Promise<QueryResult> {
       return;
     }
 
-    // Write prompt to stdin and close
-    child.stdin!.write(fullPrompt);
+    // Write stream-json message to stdin and close
+    child.stdin!.write(streamJsonMessage + '\n');
     child.stdin!.end();
 
     // Timeout

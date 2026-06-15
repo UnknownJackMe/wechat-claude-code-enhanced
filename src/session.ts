@@ -34,6 +34,11 @@ export interface PendingSetup {
   };
 }
 
+export interface PendingFileUpload {
+  items: Array<{ localPath: string; fileName: string; type: 'image' | 'file' }>;
+  startedAt: number;
+}
+
 export interface Session {
   sdkSessionId?: string;
   previousSdkSessionId?: string;
@@ -42,6 +47,7 @@ export interface Session {
   effort?: string;
   advisor?: string;
   pendingSetup?: PendingSetup;
+  pendingFileUpload?: PendingFileUpload;
   state: SessionState;
   chatHistory: ChatMessage[];
   maxHistoryLength?: number;
