@@ -12,6 +12,12 @@ import {
   type WorkspaceConfig,
 } from '../workspace-config.js';
 import {
+  loadModelAliases,
+  resolveModel,
+  upsertAlias,
+  deleteAlias,
+} from '../model-aliases.js';
+import {
   parseInterval,
   formatInterval,
   getLoopsForAccount,
@@ -40,7 +46,10 @@ const HELP_TEXT = `📋 可用命令
 /resume <uuid>      通过 session ID 恢复
 
 ━━━ 模型配置 ━━━
-/model [名称]       查看或切换模型（例: sonnet / opus）
+/model [别名/名称]  查看或切换模型
+/model-config       列出所有模型别名
+/model-config <别名> <完整模型ID>  添加/更新别名
+/model-config del <别名>           删除别名
 /effort [级别]      查看或调整思考强度
                     low / medium / high / xhigh / max
 /advisor [模型]     查看或设置 Advisor 模型
@@ -117,10 +126,13 @@ export function handleCwd(ctx: CommandContext, args: string): CommandResult {
 
 export function handleModel(ctx: CommandContext, args: string): CommandResult {
   if (!args) {
-    return { reply: '用法: /model <模型名称>\n例: /model claude-sonnet-4-6', handled: true };
+    const current = ctx.session.model || '（未设置，使用默认）';
+    return { reply: `当前模型: ${current}\n\n用法: /model <模型名称或别名>\n例: /model sonnet\n\n查看别名: /model-config`, handled: true };
   }
-  ctx.updateSession({ model: args });
-  return { reply: `✅ 模型已切换为: ${args}`, handled: true };
+  const resolved = resolveModel(args);
+  ctx.updateSession({ model: resolved });
+  const aliasNote = resolved !== args ? `\n（别名 "${args}" → ${resolved}）` : '';
+  return { reply: `✅ 模型已切换为: ${resolved}${aliasNote}`, handled: true };
 }
 
 export function handleStatus(ctx: CommandContext): CommandResult {
@@ -315,6 +327,77 @@ export function handleSend(ctx: CommandContext, args: string): CommandResult {
 /** /send-me — 别名，功能同 /send */
 export function handleSendMe(ctx: CommandContext, args: string): CommandResult {
   return handleSend(ctx, args);
+}
+
+/** /model-config — 管理模型别名 */
+export function handleModelConfig(_ctx: CommandContext, args: string): CommandResult {
+  const parts = args.trim().split(/\s+/);
+
+  // /model-config  — 列出所有别名
+  if (!args.trim()) {
+    const aliases = loadModelAliases();
+    const entries = Object.entries(aliases);
+    if (entries.length === 0) {
+      return {
+        reply: [
+          '📋 模型别名列表（空）',
+          '',
+          '用法:',
+          '  /model-config <别名> <完整模型ID>  — 添加/更新别名',
+          '  /model-config del <别名>           — 删除别名',
+          '  /model-config <别名>               — 查看单个别名',
+          '',
+          '例: /model-config sonnet claude-sonnet-4-6-thinking[1m]',
+        ].join('\n'),
+        handled: true,
+      };
+    }
+    const lines = ['📋 模型别名列表', ''];
+    for (const [alias, modelId] of entries) {
+      lines.push(`${alias}`);
+      lines.push(`  → ${modelId}`);
+    }
+    lines.push('');
+    lines.push('用 /model <别名> 切换，/model-config del <别名> 删除');
+    return { reply: lines.join('\n'), handled: true };
+  }
+
+  // /model-config del <别名>
+  if (parts[0].toLowerCase() === 'del') {
+    const alias = parts[1];
+    if (!alias) return { reply: '用法: /model-config del <别名>', handled: true };
+    const deleted = deleteAlias(alias);
+    return {
+      reply: deleted ? `✅ 已删除别名: ${alias}` : `❌ 别名不存在: ${alias}`,
+      handled: true,
+    };
+  }
+
+  // /model-config <别名>  — 查看单个
+  if (parts.length === 1) {
+    const aliases = loadModelAliases();
+    const modelId = aliases[parts[0].toLowerCase()];
+    if (!modelId) {
+      return { reply: `❌ 别名不存在: ${parts[0]}\n\n用 /model-config 查看所有别名`, handled: true };
+    }
+    return { reply: `${parts[0]}\n  → ${modelId}`, handled: true };
+  }
+
+  // /model-config <别名> <完整模型ID>  — 添加/更新
+  const alias = parts[0];
+  const modelId = parts.slice(1).join(' ');
+  upsertAlias(alias, modelId);
+  return {
+    reply: [
+      `✅ 别名已保存`,
+      '',
+      `${alias}`,
+      `  → ${modelId}`,
+      '',
+      `用 /model ${alias} 切换`,
+    ].join('\n'),
+    handled: true,
+  };
 }
 
 /** /send-you — 进入文件接收模式 */

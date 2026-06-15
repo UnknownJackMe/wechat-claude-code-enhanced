@@ -37,6 +37,28 @@
 
 ---
 
+### `/model-config` — 模型别名管理
+
+每次切换模型都要输入完整的 model ID 很麻烦，`/model-config` 让你绑定一个短别名。
+
+```
+/model-config                                          — 列出所有别名
+/model-config sonnet claude-sonnet-4-6-thinking[1m]   — 添加/更新别名
+/model-config del sonnet                               — 删除别名
+/model-config sonnet                                   — 查看单个别名
+```
+
+配置好别名后，直接用 `/model sonnet` 切换即可，无需输入完整 ID。切换时会显示别名展开结果：
+
+```
+✅ 模型已切换为: claude-sonnet-4-6-thinking[1m]
+（别名 "sonnet" → claude-sonnet-4-6-thinking[1m]）
+```
+
+别名数据持久化存储在 `~/.wechat-claude-code/model-aliases.json`，daemon 重启后保留。
+
+---
+
 ### `/effort` — 思考强度调节
 
 调整 Claude 的推理深度，在速度与质量之间按需切换。
@@ -154,7 +176,10 @@ npm run daemon -- logs       # 查看日志
 /resume <uuid>      通过 session ID 恢复
 
 ━━━ 模型配置 ━━━
-/model [名称]       查看或切换模型
+/model [别名/名称]  查看或切换模型
+/model-config       列出所有模型别名
+/model-config <别名> <完整ID>  添加/更新别名
+/model-config del <别名>       删除别名
 /effort [级别]      查看或调整思考强度（low/medium/high/xhigh/max）
 /advisor [模型]     查看或设置 Advisor 模型（opus/sonnet/fable/off）
 

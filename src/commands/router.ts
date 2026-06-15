@@ -1,7 +1,7 @@
 import type { Session } from '../session.js';
 import { findSkill } from '../claude/skill-scanner.js';
 import { logger } from '../logger.js';
-import { handleHelp, handleClear, handleCwd, handleModel, handleStatus, handleSkills, handleHistory, handleReset, handleCompact, handleUndo, handleVersion, handlePrompt, handleSend, handleSendMe, handleSendYou, handleSendYouCancel, handleSendYouEnd, handleResume, handleEffort, handleAdvisor, handleGoal, handleLoop, handleConfigs, handleSwitchConfig, handleSetConfig, handleDeleteConfig, handleSetupWizard, handleUnknown } from './handlers.js';
+import { handleHelp, handleClear, handleCwd, handleModel, handleModelConfig, handleStatus, handleSkills, handleHistory, handleReset, handleCompact, handleUndo, handleVersion, handlePrompt, handleSend, handleSendMe, handleSendYou, handleSendYouCancel, handleSendYouEnd, handleResume, handleEffort, handleAdvisor, handleGoal, handleLoop, handleConfigs, handleSwitchConfig, handleSetConfig, handleDeleteConfig, handleSetupWizard, handleUnknown } from './handlers.js';
 
 export interface CommandContext {
   accountId: string;
@@ -61,6 +61,8 @@ export function routeCommand(ctx: CommandContext): CommandResult {
       return handleCwd(ctx, args);
     case 'model':
       return handleModel(ctx, args);
+    case 'model-config':
+      return handleModelConfig(ctx, args);
     case 'prompt':
       return handlePrompt(ctx, args);
     case 'status':
