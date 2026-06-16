@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "description": "Chat with Claude Code from WeChat - a Claude Code Skill that bridges personal WeChat to local Claude Code",
   "type": "module",
+  "bin": {
+    "wechat-claude": "dist/main.js"
+  },
   "scripts": {
     "build": "tsc",
     "postinstall": "npm run build",

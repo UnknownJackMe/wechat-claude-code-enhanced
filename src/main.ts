@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 import { createInterface } from 'node:readline';
 import process from 'node:process';
 import { spawnSync } from 'node:child_process';
