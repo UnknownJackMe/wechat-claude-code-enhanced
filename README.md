@@ -37,9 +37,37 @@
 
 ---
 
+### `/mode` — 权限审批模式
+
+控制 Claude 执行工具（运行命令、改文件等）时是否需要你确认。守护进程始终以 `--dangerously-skip-permissions` 启动，由 `/mode` 在两种行为间切换：
+
+```
+/mode          — 查看当前模式
+/mode bypass   — 全自动，不再询问（默认）
+/mode accept   — 每个操作推送到微信，回复 y 批准 / n 拒绝
+```
+
+`accept` 模式下，Claude 每次要用工具，会把工具名 + 命令/文件推送到微信，例如：
+
+```
+🔐 需要你确认操作
+
+工具: Bash
+命令:
+  git push origin main
+
+回复 y 批准 / n 拒绝（30 秒内有效）
+```
+
+回复 `y`/`n`（或 `是`/`否`）即可。30 秒未回复自动拒绝；审批等待期间发 `/stop` 会中止当前操作。技术上通过 `--permission-prompt-tool stdio` 的 `control_request`/`control_response` 协议实现，CLI 在等待期间阻塞，不会误执行。
+
+---
+
 ### `/model-config` — 模型别名管理
 
 每次切换模型都要输入完整的 model ID 很麻烦，`/model-config` 让你绑定一个短别名。
+
+切换模型时（无论是 `/model` 还是别名）会先用一个极短的探测请求**实际验证模型可用性**，再提交切换。验证失败会告诉你具体原因——模型名无效、认证/欠费、网络不可达、限流等——并保持原模型不变。这避免了输入无效模型导致守护进程静默卡死。
 
 ```
 /model-config                                          — 列出所有别名
@@ -216,6 +244,7 @@ npm run daemon -- logs       # 查看日志
 /model-config       列出所有模型别名
 /model-config <别名> <完整ID>  添加/更新别名
 /model-config del <别名>       删除别名
+/mode [bypass|accept] 权限模式：全自动 / 逐个 y/n 确认
 /effort [级别]      查看或调整思考强度（low/medium/high/xhigh/max）
 /advisor [模型]     查看或设置 Advisor 模型（opus/sonnet/fable/off）
 

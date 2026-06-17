@@ -1,7 +1,7 @@
 import type { Session } from '../session.js';
 import { findSkill } from '../claude/skill-scanner.js';
 import { logger } from '../logger.js';
-import { handleHelp, handleClear, handleCwd, handleModel, handleModelConfig, handleQuick, handleStatus, handleSkills, handleHistory, handleReset, handleCompact, handleUndo, handleVersion, handlePrompt, handleSend, handleSendMe, handleSendYou, handleSendYouCancel, handleSendYouEnd, handleResume, handleEffort, handleAdvisor, handleGoal, handleLoop, handleConfigs, handleSwitchConfig, handleSetConfig, handleDeleteConfig, handleSetupWizard, handleUnknown } from './handlers.js';
+import { handleHelp, handleClear, handleCwd, handleModel, handleMode, handleModelConfig, handleQuick, handleStatus, handleSkills, handleHistory, handleReset, handleCompact, handleUndo, handleVersion, handlePrompt, handleSend, handleSendMe, handleSendYou, handleSendYouCancel, handleSendYouEnd, handleResume, handleEffort, handleAdvisor, handleGoal, handleLoop, handleConfigs, handleSwitchConfig, handleSetConfig, handleDeleteConfig, handleSetupWizard, handleUnknown } from './handlers.js';
 
 export interface CommandContext {
   accountId: string;
@@ -20,6 +20,8 @@ export interface CommandResult {
   sendFiles?: string[];
   compactSession?: boolean;
   startLoop?: { prompt: string; intervalMs: number };
+  /** Validate this model via a probe before committing the switch (handled in main.ts). */
+  validateModel?: string;
   sendYouPayload?: {
     requirement: string;
     items: Array<{ localPath: string; fileName: string; type: 'image' | 'file' }>;
@@ -61,6 +63,8 @@ export function routeCommand(ctx: CommandContext): CommandResult {
       return handleCwd(ctx, args);
     case 'model':
       return handleModel(ctx, args);
+    case 'mode':
+      return handleMode(ctx, args);
     case 'model-config':
       return handleModelConfig(ctx, args);
     case 'q':

@@ -46,6 +46,8 @@ export interface Session {
   model?: string;
   effort?: string;
   advisor?: string;
+  /** 'bypass' = full auto; 'approve' = ask y/n via WeChat for each tool. Default 'bypass'. */
+  permissionMode?: 'bypass' | 'approve';
   pendingSetup?: PendingSetup;
   pendingFileUpload?: PendingFileUpload;
   state: SessionState;

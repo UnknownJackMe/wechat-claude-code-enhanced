@@ -14,7 +14,7 @@ import { createSender } from './wechat/send.js';
 import { downloadImage, extractText, extractFirstImageUrl, extractFirstFileItem, extractFirstVoiceItem, downloadFile, downloadAllMedia } from './wechat/media.js';
 import { createSessionStore, type Session } from './session.js';
 import { routeCommand, handleSetupWizard, type CommandContext, type CommandResult } from './commands/router.js';
-import { claudeQuery, type QueryOptions } from './claude/provider.js';
+import { claudeQuery, validateModel, type QueryOptions, type PermissionRequest } from './claude/provider.js';
 import { transcribeVoice } from './wechat/voice-transcribe.js';
 import { loadConfig, saveConfig } from './config.js';
 import { logger } from './logger.js';
@@ -41,6 +41,47 @@ function scheduleLoopGlobal(loop: LoopEntry): void {
 let _reconcileLoopTimers: (() => void) | null = null;
 function reconcileLoopTimersGlobal(): void {
   if (_reconcileLoopTimers) _reconcileLoopTimers();
+}
+
+// -- Pending permission approval (approve mode) --
+// When the CLI asks to use a tool, we park a resolver here and push the request
+// to WeChat. The user's y/n reply (handled as a priority command) resolves it.
+interface PendingApproval {
+  accountId: string;
+  resolve: (decision: { behavior: 'allow' | 'deny'; message?: string }) => void;
+  toolName: string;
+  timer: ReturnType<typeof setTimeout>;
+}
+const pendingApprovals = new Map<string, PendingApproval>();
+const APPROVAL_TIMEOUT_MS = 30_000;
+
+/** Resolve a parked approval for an account with allow/deny. Returns true if one existed. */
+function resolveApproval(accountId: string, behavior: 'allow' | 'deny', message?: string): boolean {
+  const pending = pendingApprovals.get(accountId);
+  if (!pending) return false;
+  clearTimeout(pending.timer);
+  pendingApprovals.delete(accountId);
+  pending.resolve({ behavior, message });
+  return true;
+}
+
+/** Build a concise, readable WeChat message describing a tool-permission request. */
+function formatApprovalRequest(req: PermissionRequest): string {
+  const lines = ['🔐 需要你确认操作', '', `工具: ${req.toolName}`];
+  const input = req.input ?? {};
+  // Surface the most useful field per common tool, fall back to compact JSON.
+  if (typeof input.command === 'string') {
+    lines.push('', `命令:\n  ${input.command}`);
+    if (input.description) lines.push('', `说明: ${input.description}`);
+  } else if (typeof input.file_path === 'string') {
+    lines.push('', `文件:\n  ${input.file_path}`);
+  } else {
+    const json = JSON.stringify(input);
+    lines.push('', `参数:\n  ${json.length > 400 ? json.slice(0, 400) + '…' : json}`);
+  }
+  if (req.decisionReason) lines.push('', `原因: ${req.decisionReason}`);
+  lines.push('', '回复 y 批准 / n 拒绝（30 秒内有效）');
+  return lines.join('\n');
 }
 
 // Extensions eligible for auto-push when detected in Claude's response
@@ -374,10 +415,31 @@ async function runDaemon(): Promise<void> {
 
   // -- Wire the monitor callbacks --
 
-  /** Handle priority commands (/stop, /clear) immediately, bypassing the serial queue. */
+  /** Handle priority commands (/stop, /clear, y/n approval) immediately, bypassing the serial queue. */
   function handlePriorityCommand(msg: WeixinMessage): boolean {
     if (msg.message_type !== MessageType.USER || !msg.item_list) return false;
-    const text = extractTextFromItems(msg.item_list);
+    const text = extractTextFromItems(msg.item_list).trim();
+
+    // Approval reply (y/n) — only meaningful while a tool approval is pending.
+    if (pendingApprovals.has(account!.accountId)) {
+      const lower = text.toLowerCase();
+      const isYes = lower === 'y' || lower === 'yes' || lower === '是' || lower === '同意' || lower === '批准';
+      const isNo = lower === 'n' || lower === 'no' || lower === '否' || lower === '拒绝' || lower === '不';
+      if (isYes || isNo) {
+        resolveApproval(account!.accountId, isYes ? 'allow' : 'deny', isYes ? undefined : '用户拒绝了此操作');
+        sender.sendText(msg.from_user_id!, msg.context_token ?? '', isYes ? '✅ 已批准' : '🚫 已拒绝').catch(() => {});
+        return true;
+      }
+      // /stop and /clear should still work: deny the pending op, then fall through.
+      if (text.startsWith('/stop') || text.startsWith('/clear')) {
+        resolveApproval(account!.accountId, 'deny', '用户中止了对话');
+      } else {
+        // Any other message while awaiting approval: remind the user.
+        sender.sendText(msg.from_user_id!, msg.context_token ?? '', '⏳ 正在等待你确认上一个操作，请回复 y 批准 / n 拒绝。').catch(() => {});
+        return true;
+      }
+    }
+
     if (!text.startsWith('/stop') && !text.startsWith('/clear')) return false;
     if (session.state !== 'processing') return false;
 
@@ -668,6 +730,43 @@ async function handleMessage(
         fromUserId, contextToken,
         account, session, sessionStore, sender, config,
       );
+      return;
+    }
+
+    if (result.handled && result.validateModel) {
+      const target = result.validateModel;
+      const cwd = (session.workingDirectory || config.workingDirectory).replace(/^~/, homedir());
+      const stopTyping = sender.startTyping(fromUserId, contextToken);
+      await sender.sendText(fromUserId, contextToken, `⏳ 正在验证模型 ${target} ...`);
+      let v;
+      try {
+        v = await validateModel(target, cwd);
+      } finally {
+        stopTyping();
+      }
+      if (v.ok) {
+        session.model = target;
+        sessionStore.save(account.accountId, session);
+        await sender.sendText(fromUserId, contextToken, `✅ 模型已切换为:\n  ${target}`);
+      } else {
+        const reasonText: Record<string, string> = {
+          invalid_model: '模型名称无效（该模型不存在或拼写有误）',
+          auth: '认证问题（API 密钥无效、欠费或无权访问该模型）',
+          network: '网络问题（无法连接到模型服务）',
+          rate_limit: '服务限流或过载，请稍后重试',
+          timeout: '探测超时无响应（多为模型名无效或服务不可达）',
+          unknown: '未知错误',
+        };
+        const label = reasonText[v.reason ?? 'unknown'] ?? '未知错误';
+        const lines = [
+          `❌ 模型 ${target} 不可用`,
+          '',
+          `原因: ${label}`,
+        ];
+        if (v.detail) lines.push('', `详情: ${v.detail}`);
+        lines.push('', `当前仍使用:\n  ${session.model ?? '默认'}`);
+        await sender.sendText(fromUserId, contextToken, lines.join('\n'));
+      }
       return;
     }
 
@@ -991,6 +1090,27 @@ async function sendToClaude(
       ].filter(Boolean).join('\n'),
       abortController,
       images,
+      permissionMode: session.permissionMode ?? 'bypass',
+      onPermissionRequest: (session.permissionMode === 'approve')
+        ? (req) => new Promise<{ behavior: 'allow' | 'deny'; message?: string }>((resolveDecision) => {
+            // Park the resolver; the user's y/n reply (priority command) resolves it.
+            const timer = setTimeout(() => {
+              if (pendingApprovals.get(account.accountId)?.resolve === resolveDecision) {
+                pendingApprovals.delete(account.accountId);
+              }
+              sender.sendText(fromUserId, contextToken, '⏱ 30 秒未确认，已自动拒绝此操作。').catch(() => {});
+              resolveDecision({ behavior: 'deny', message: '审批超时' });
+            }, APPROVAL_TIMEOUT_MS);
+            pendingApprovals.set(account.accountId, {
+              accountId: account.accountId,
+              resolve: resolveDecision,
+              toolName: req.toolName,
+              timer,
+            });
+            const detail = formatApprovalRequest(req);
+            sender.sendText(fromUserId, contextToken, detail).catch(() => {});
+          })
+        : undefined,
       onText: async (delta: string) => {
         textBuffer += delta;
 
@@ -1100,6 +1220,8 @@ async function sendToClaude(
   } finally {
     clearInterval(flushTimer);
     stopTyping();
+    // Clean up any lingering pending approval for this account (e.g. query ended/aborted mid-prompt).
+    resolveApproval(account.accountId, 'deny', '对话已结束');
     resetSessionStateSafely(sessionStore, account.accountId, session, 'sendToClaude finally');
     // Clean up the abort controller if it's still ours
     if (activeControllers.get(account.accountId) === abortController) {

@@ -48,8 +48,101 @@ function versionAtLeast(major: number, minor: number, patch: number): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Model validation — probe a model with a tiny prompt and a strict timeout.
+// An invalid --model hangs silently (no output, no error), so timeout is the
+// primary signal; a returned error result lets us classify the failure.
+// ---------------------------------------------------------------------------
+
+export interface ModelValidationResult {
+  ok: boolean;
+  /** Failure category for a friendly message. */
+  reason?: 'invalid_model' | 'auth' | 'network' | 'rate_limit' | 'timeout' | 'unknown';
+  detail?: string;
+}
+
+const MODEL_PROBE_TIMEOUT_MS = 20_000;
+
+export async function validateModel(model: string, cwd: string): Promise<ModelValidationResult> {
+  return new Promise<ModelValidationResult>((resolve) => {
+    let settled = false;
+    const finish = (r: ModelValidationResult) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { child.kill('SIGKILL'); } catch { /* ignore */ }
+      resolve(r);
+    };
+
+    let child: ChildProcess;
+    try {
+      child = spawn('claude', [
+        '-p', 'reply with just: ok',
+        '--model', model,
+        '--output-format', 'json',
+        '--dangerously-skip-permissions',
+      ], { cwd, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env } });
+    } catch (err) {
+      finish({ ok: false, reason: 'unknown', detail: err instanceof Error ? err.message : String(err) });
+      return;
+    }
+
+    // Invalid model hangs with no output — timeout is how we catch it.
+    const timer = setTimeout(() => {
+      finish({ ok: false, reason: 'timeout', detail: '探测超时（无响应），通常是模型名无效或服务无法访问' });
+    }, MODEL_PROBE_TIMEOUT_MS);
+
+    const out: string[] = [];
+    const errOut: string[] = [];
+    child.stdout!.setEncoding('utf8');
+    child.stdout!.on('data', (c: string) => out.push(c));
+    child.stderr!.setEncoding('utf8');
+    child.stderr!.on('data', (c: string) => errOut.push(c));
+
+    child.on('error', (err) => {
+      finish({ ok: false, reason: 'unknown', detail: err.message });
+    });
+
+    child.on('close', () => {
+      if (settled) return;
+      const stdout = out.join('').trim();
+      const stderr = errOut.join('').trim();
+      let parsed: any;
+      try { parsed = JSON.parse(stdout); } catch { /* not json */ }
+
+      if (parsed && parsed.is_error === false && parsed.subtype === 'success') {
+        finish({ ok: true });
+        return;
+      }
+
+      // Classify from whatever error text we have.
+      const blob = `${parsed?.result ?? ''} ${parsed?.api_error_status ?? ''} ${stderr}`.toLowerCase();
+      let reason: ModelValidationResult['reason'] = 'unknown';
+      if (/model|not found|unknown model|does not exist|invalid model/.test(blob)) reason = 'invalid_model';
+      else if (/auth|api key|unauthor|401|403|forbidden|credit|billing/.test(blob)) reason = 'auth';
+      else if (/network|timeout|econn|enotfound|getaddrinfo|fetch failed|socket/.test(blob)) reason = 'network';
+      else if (/rate|429|overloaded|529/.test(blob)) reason = 'rate_limit';
+      const detail = (parsed?.result || parsed?.api_error_status || stderr || '').slice(0, 200);
+      finish({ ok: false, reason, detail });
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
+
+export interface PermissionRequest {
+  requestId: string;
+  toolName: string;
+  input: any;
+  decisionReason?: string;
+}
+
+export interface PermissionDecision {
+  behavior: 'allow' | 'deny';
+  message?: string;
+  updatedInput?: any;
+}
 
 export interface QueryOptions {
   prompt: string;
@@ -60,6 +153,10 @@ export interface QueryOptions {
   advisor?: string;
   addDirs?: string[];
   systemPrompt?: string;
+  /** 'bypass' = full auto (--dangerously-skip-permissions); 'approve' = ask via stdio for each tool. */
+  permissionMode?: 'bypass' | 'approve';
+  /** Called in approve mode when the CLI requests permission for a tool. Resolve with allow/deny. */
+  onPermissionRequest?: (req: PermissionRequest) => Promise<PermissionDecision>;
   images?: Array<{
     type: "image";
     source: { type: "base64"; media_type: string; data: string };
@@ -121,11 +218,15 @@ export async function claudeQuery(options: QueryOptions): Promise<QueryResult> {
     advisor,
     addDirs,
     systemPrompt,
+    permissionMode,
+    onPermissionRequest,
     images,
     onText,
     onBlockEnd,
     abortController,
   } = options;
+
+  const approveMode = permissionMode === 'approve' && !!onPermissionRequest;
 
   logger.info("Starting Claude CLI query", {
     cwd,
@@ -133,6 +234,7 @@ export async function claudeQuery(options: QueryOptions): Promise<QueryResult> {
     effort,
     resume: !!resume,
     hasImages: !!images?.length,
+    permissionMode: approveMode ? 'approve' : 'bypass',
   });
 
   // Build CLI arguments
@@ -142,8 +244,15 @@ export async function claudeQuery(options: QueryOptions): Promise<QueryResult> {
     '--output-format', 'stream-json',
     '--verbose',
     '--include-partial-messages',
-    '--dangerously-skip-permissions',
   ];
+
+  if (approveMode) {
+    // Approve mode: route each permission prompt over stdio so we can ask via WeChat.
+    args.push('--permission-prompt-tool', 'stdio');
+  } else {
+    // Bypass mode: full auto, no prompts.
+    args.push('--dangerously-skip-permissions');
+  }
 
   if (resume) args.push('--resume', resume);
   if (model) args.push('--model', model);
@@ -267,20 +376,37 @@ export async function claudeQuery(options: QueryOptions): Promise<QueryResult> {
       }
     };
 
+    let stdinErrorHooked = false;
+    const hookStdinError = () => {
+      const stdin = child?.stdin;
+      if (!stdin || stdinErrorHooked) return;
+      stdinErrorHooked = true;
+      stdin.on('error', (err: NodeJS.ErrnoException) => {
+        if (err.code !== 'EPIPE' && err.code !== 'ERR_STREAM_DESTROYED') {
+          logger.warn('Claude CLI stdin stream errored', { code: err.code, message: err.message });
+        }
+      });
+    };
+
+    /** Write a line to stdin without closing it (used for control_response in approve mode). */
+    const writeStdin = (input: string) => {
+      const stdin = child?.stdin;
+      if (!stdin || stdin.destroyed) return;
+      hookStdinError();
+      try {
+        stdin.write(input);
+      } catch (err) {
+        logger.warn('Claude CLI stdin write failed', { message: err instanceof Error ? err.message : String(err) });
+      }
+    };
+
     const safeSendInput = (input: string) => {
       const stdin = child?.stdin;
       if (!stdin) return;
 
       // Fix for issue 2: stdin writes can throw or emit EPIPE if the child exits
       // before consuming input, so guard both synchronous and async paths.
-      stdin.once('error', (err: NodeJS.ErrnoException) => {
-        if (err.code !== 'EPIPE' && err.code !== 'ERR_STREAM_DESTROYED') {
-          logger.warn('Claude CLI stdin stream errored', {
-            code: err.code,
-            message: err.message,
-          });
-        }
-      });
+      hookStdinError();
 
       try {
         stdin.write(input);
@@ -288,6 +414,10 @@ export async function claudeQuery(options: QueryOptions): Promise<QueryResult> {
         const message = err instanceof Error ? err.message : String(err);
         logger.warn('Claude CLI stdin write failed', { message });
       }
+
+      // Approve mode keeps stdin open for control_response messages; only end it
+      // in bypass mode where the single user message is all we send.
+      if (approveMode) return;
 
       try {
         stdin.end();
@@ -374,6 +504,38 @@ export async function claudeQuery(options: QueryOptions): Promise<QueryResult> {
       }
 
       switch (obj.type) {
+        case 'control_request': {
+          // Approve mode: CLI is asking permission for a tool. Ask via callback,
+          // then write the control_response back to stdin. CLI blocks until we reply.
+          const req = obj.request;
+          if (approveMode && onPermissionRequest && req?.subtype === 'can_use_tool') {
+            const requestId: string = obj.request_id;
+            const permReq: PermissionRequest = {
+              requestId,
+              toolName: req.tool_name,
+              input: req.input,
+              decisionReason: req.decision_reason,
+            };
+            Promise.resolve(onPermissionRequest(permReq))
+              .then((decision) => {
+                const response = decision.behavior === 'allow'
+                  ? { behavior: 'allow', updatedInput: decision.updatedInput ?? req.input }
+                  : { behavior: 'deny', message: decision.message ?? 'User denied this action' };
+                writeStdin(JSON.stringify({
+                  type: 'control_response',
+                  response: { subtype: 'success', request_id: requestId, response },
+                }) + '\n');
+              })
+              .catch((err) => {
+                logger.warn('Permission callback failed, denying', { error: err instanceof Error ? err.message : String(err) });
+                writeStdin(JSON.stringify({
+                  type: 'control_response',
+                  response: { subtype: 'success', request_id: requestId, response: { behavior: 'deny', message: 'Approval error' } },
+                }) + '\n');
+              });
+          }
+          break;
+        }
         case 'system': {
           if (obj.subtype === 'init' && obj.session_id) {
             sessionId = obj.session_id;
@@ -440,6 +602,11 @@ export async function claudeQuery(options: QueryOptions): Promise<QueryResult> {
             const errors = obj.errors ?? [obj.error_message ?? 'Unknown error'];
             errorMessage = Array.isArray(errors) ? errors.join('; ') : String(errors);
             logger.error('CLI returned error result', { errors });
+          }
+          // In approve mode stdin is kept open for control_response; the turn is now
+          // done, so close stdin to let the CLI exit instead of waiting for more input.
+          if (approveMode) {
+            try { child?.stdin?.end(); } catch { /* ignore */ }
           }
           break;
         }

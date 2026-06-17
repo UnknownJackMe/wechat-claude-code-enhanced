@@ -58,6 +58,7 @@ const HELP_TEXT = `📋 可用命令
 /model-config       列出所有模型别名
 /model-config <别名> <完整模型ID>  添加/更新别名
 /model-config del <别名>           删除别名
+/mode [bypass|accept] 权限模式：全自动 / 逐个 y/n 确认
 /effort [级别]      查看或调整思考强度
                     low / medium / high / xhigh / max
 /advisor [模型]     查看或设置 Advisor 模型
@@ -150,10 +151,50 @@ export function handleModel(ctx: CommandContext, args: string): CommandResult {
     const current = ctx.session.model || '（未设置，使用默认）';
     return { reply: `当前模型: ${current}\n\n用法: /model <模型名称或别名>\n例: /model sonnet\n\n查看别名: /model-config`, handled: true };
   }
+  // Resolve alias, then ask main.ts to probe the model before committing the switch.
+  // (An invalid --model hangs silently, so we validate rather than trust the input.)
   const resolved = resolveModel(args);
-  ctx.updateSession({ model: resolved });
-  const aliasNote = resolved !== args ? `\n（别名 "${args}" → ${resolved}）` : '';
-  return { reply: `✅ 模型已切换为: ${resolved}${aliasNote}`, handled: true };
+  return { handled: true, validateModel: resolved };
+}
+
+/** /mode — 切换权限模式：bypass(全自动) / accept(逐个 y/n 确认) */
+export function handleMode(ctx: CommandContext, args: string): CommandResult {
+  const cur = ctx.session.permissionMode ?? 'bypass';
+  const curLabel = cur === 'approve' ? 'accept edits on（每个操作需 y/n 确认）' : 'bypass permissions on（全自动）';
+  const arg = args.trim().toLowerCase();
+
+  if (!arg) {
+    return {
+      reply: [
+        '🔐 权限模式',
+        '',
+        `当前: ${curLabel}`,
+        '',
+        '切换:',
+        '  /mode bypass  — 全自动，不再询问',
+        '  /mode accept  — 每个操作推送到微信，回复 y 批准 / n 拒绝',
+      ].join('\n'),
+      handled: true,
+    };
+  }
+
+  if (arg === 'bypass' || arg === 'b') {
+    ctx.updateSession({ permissionMode: 'bypass' });
+    return { reply: '✅ 已切换为 bypass permissions on\n全自动执行，不再询问。', handled: true };
+  }
+  if (arg === 'accept' || arg === 'a' || arg === 'acceptedits') {
+    ctx.updateSession({ permissionMode: 'approve' });
+    return {
+      reply: [
+        '✅ 已切换为 accept edits on',
+        '',
+        '之后 Claude 每次要执行工具，会推送到微信，',
+        '回复 y 批准 / n 拒绝（30 秒内未回复自动拒绝）。',
+      ].join('\n'),
+      handled: true,
+    };
+  }
+  return { reply: '用法: /mode bypass 或 /mode accept', handled: true };
 }
 
 export function handleStatus(ctx: CommandContext): CommandResult {
@@ -181,6 +222,8 @@ export function handleStatus(ctx: CommandContext): CommandResult {
     `思考强度:\n  ${s.effort ?? '默认 (high)'}`,
     '',
     `Advisor:\n  ${s.advisor ?? '未启用'}`,
+    '',
+    `权限模式:\n  ${(s.permissionMode ?? 'bypass') === 'approve' ? 'accept edits（逐个 y/n）' : 'bypass（全自动）'}`,
     '',
     `会话 ID:\n  ${s.sdkSessionId ?? '无'}`,
     '',
