@@ -3,7 +3,7 @@ import { createInterface } from 'node:readline';
 import process from 'node:process';
 import { spawnSync } from 'node:child_process';
 import { join, basename } from 'node:path';
-import { unlinkSync, writeFileSync, mkdirSync } from 'node:fs';
+import { unlinkSync, writeFileSync, mkdirSync, readdirSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 
 import { WeChatApi } from './wechat/api.js';
@@ -29,12 +29,17 @@ import {
 // ---------------------------------------------------------------------------
 
 const MAX_MESSAGE_LENGTH = 4000;
+const STALE_PENDING_UPLOAD_MS = 30 * 60 * 1000;
 
 // Loop scheduler — module-level so handleMessage can call scheduleLoop
 // after startDaemon sets it up.
 let _scheduleLoop: ((loop: LoopEntry) => void) | null = null;
 function scheduleLoopGlobal(loop: LoopEntry): void {
   if (_scheduleLoop) _scheduleLoop(loop);
+}
+let _reconcileLoopTimers: (() => void) | null = null;
+function reconcileLoopTimersGlobal(): void {
+  if (_reconcileLoopTimers) _reconcileLoopTimers();
 }
 
 // Extensions eligible for auto-push when detected in Claude's response
@@ -177,6 +182,72 @@ function openFile(filePath: string): void {
   }
 }
 
+function saveSessionSafely(
+  sessionStore: ReturnType<typeof createSessionStore>,
+  accountId: string,
+  session: Session,
+  context: string,
+): boolean {
+  try {
+    sessionStore.save(accountId, session);
+    return true;
+  } catch (err) {
+    logger.error('Failed to save session', {
+      accountId,
+      context,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return false;
+  }
+}
+
+function resetSessionStateSafely(
+  sessionStore: ReturnType<typeof createSessionStore>,
+  accountId: string,
+  session: Session,
+  context: string,
+): void {
+  session.state = 'idle';
+  saveSessionSafely(sessionStore, accountId, session, context);
+}
+
+function clearStalePendingUploads(sessionStore: ReturnType<typeof createSessionStore>): void {
+  const sessionsDir = join(DATA_DIR, 'sessions');
+  let entries: string[] = [];
+  try {
+    entries = readdirSync(sessionsDir);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code !== 'ENOENT') {
+      logger.warn('Failed to scan sessions for stale pending uploads', {
+        dir: sessionsDir,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+    return;
+  }
+
+  const cutoff = Date.now() - STALE_PENDING_UPLOAD_MS;
+  for (const entry of entries) {
+    if (!entry.endsWith('.json')) continue;
+    const accountId = entry.slice(0, -'.json'.length);
+    if (!accountId) continue;
+
+    const session = sessionStore.load(accountId);
+    const pending = session.pendingFileUpload;
+    if (!pending) continue;
+
+    if (!pending.startedAt || pending.startedAt < cutoff) {
+      logger.warn('Clearing stale pending file upload on startup', {
+        accountId,
+        startedAt: pending.startedAt,
+      });
+      delete session.pendingFileUpload;
+      saveSessionSafely(sessionStore, accountId, session, 'clear stale pendingFileUpload on startup');
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Setup
 // ---------------------------------------------------------------------------
@@ -263,6 +334,7 @@ async function runDaemon(): Promise<void> {
 
   const api = new WeChatApi(account.botToken, account.baseUrl);
   const sessionStore = createSessionStore();
+  clearStalePendingUploads(sessionStore);
   const session: Session = sessionStore.load(account.accountId);
 
   // Fix: backfill session workingDirectory from config if it's still the default process.cwd()
@@ -289,11 +361,14 @@ async function runDaemon(): Promise<void> {
   async function drainQueue(): Promise<void> {
     if (processingQueue) return;
     processingQueue = true;
-    while (messageQueue.length > 0) {
-      const msg = messageQueue.shift()!;
-      await handleMessage(msg, account!, session, sessionStore, sender, config, sharedCtx, activeControllers, messageQueue);
+    try {
+      while (messageQueue.length > 0) {
+        const msg = messageQueue.shift()!;
+        await handleMessage(msg, account!, session, sessionStore, sender, config, sharedCtx, activeControllers, messageQueue);
+      }
+    } finally {
+      processingQueue = false;
     }
-    processingQueue = false;
   }
 
   // -- Wire the monitor callbacks --
@@ -335,6 +410,22 @@ async function runDaemon(): Promise<void> {
 
   const loopTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
+  function clearLoopTimer(loopId: string): void {
+    const timer = loopTimers.get(loopId);
+    if (!timer) return;
+    clearTimeout(timer);
+    loopTimers.delete(loopId);
+  }
+
+  function reconcileLoopTimers(): void {
+    const activeLoopIds = new Set(getLoopsForAccount(account!.accountId).map(loop => loop.id));
+    for (const loopId of [...loopTimers.keys()]) {
+      if (!activeLoopIds.has(loopId)) {
+        clearLoopTimer(loopId);
+      }
+    }
+  }
+
   function scheduleLoop(loop: LoopEntry): void {
     if (loopTimers.has(loop.id)) return;
     const delay = Math.max(0, loop.nextFireAt - Date.now());
@@ -362,10 +453,17 @@ async function runDaemon(): Promise<void> {
         }
       }
 
+      const latest = loadLoops().find(l => l.id === loop.id);
+      if (!latest) {
+        logger.info('Loop removed during execution, skipping reschedule', { id: loop.id });
+        clearLoopTimer(loop.id);
+        return;
+      }
+
       // Reschedule
-      const nextFireAt = Date.now() + current.intervalMs;
+      const nextFireAt = Date.now() + latest.intervalMs;
       updateNextFire(loop.id, nextFireAt);
-      scheduleLoop({ ...current, nextFireAt });
+      scheduleLoop({ ...latest, nextFireAt });
     }, delay);
     loopTimers.set(loop.id, timer);
   }
@@ -378,10 +476,14 @@ async function runDaemon(): Promise<void> {
 
   // Expose scheduleLoop globally so handleMessage can use it
   _scheduleLoop = scheduleLoop;
+  _reconcileLoopTimers = reconcileLoopTimers;
 
   function shutdown(): void {
     logger.info('Shutting down...');
+    for (const controller of activeControllers.values()) controller.abort();
+    activeControllers.clear();
     for (const timer of loopTimers.values()) clearTimeout(timer);
+    loopTimers.clear();
     monitor.stop();
     process.exit(0);
   }
@@ -522,6 +624,10 @@ async function handleMessage(
 
     const result: CommandResult = routeCommand(ctx);
 
+    if (userText.trim().toLowerCase().startsWith('/loop')) {
+      reconcileLoopTimersGlobal();
+    }
+
     if (result.handled && result.reply) {
       await sender.sendText(fromUserId, contextToken, result.reply);
       return;
@@ -586,7 +692,6 @@ async function handleMessage(
             });
           } catch (err) {
             logger.warn('Failed to read collected image', { path: it.localPath, error: err instanceof Error ? err.message : String(err) });
-            collectedFilePaths.push(it.localPath);
           }
         } else {
           collectedFilePaths.push(it.localPath);
@@ -661,6 +766,9 @@ async function compactSession(
   sender: ReturnType<typeof createSender>,
   config: ReturnType<typeof loadConfig>,
 ): Promise<void> {
+  session.state = 'processing';
+  saveSessionSafely(sessionStore, account.accountId, session, 'mark compactSession processing');
+
   const stopTyping = sender.startTyping(fromUserId, contextToken);
   try {
     await sender.sendText(fromUserId, contextToken, '⏳ 正在压缩上下文，请稍候（通常需要1-2分钟）...');
@@ -683,7 +791,7 @@ async function compactSession(
 
     // session ID 保持不变（compact 不会改变 session ID）
     session.sdkSessionId = result.sessionId || session.sdkSessionId;
-    sessionStore.save(account.accountId, session);
+    saveSessionSafely(sessionStore, account.accountId, session, 'save compactSession session id');
 
     // Parse compact stats from the sentinel we injected in provider.ts
     let statsLine = '';
@@ -700,6 +808,7 @@ async function compactSession(
     const msg = err instanceof Error ? err.message : String(err);
     await sender.sendText(fromUserId, contextToken, `❌ 压缩出错: ${msg}`);
   } finally {
+    resetSessionStateSafely(sessionStore, account.accountId, session, 'compactSession finally');
     stopTyping();
   }
 }
@@ -723,7 +832,7 @@ async function sendToClaude(
 ): Promise<void> {
   // Set state to processing
   session.state = 'processing';
-  sessionStore.save(account.accountId, session);
+  saveSessionSafely(sessionStore, account.accountId, session, 'mark sendToClaude processing');
 
   // Create abort controller for this query so it can be cancelled by new messages
   const abortController = new AbortController();
@@ -886,7 +995,7 @@ async function sendToClaude(
       logger.warn('Resume failed, retrying without resume', { error: result.error, sessionId: queryOptions.resume });
       queryOptions.resume = undefined;
       session.sdkSessionId = undefined;
-      sessionStore.save(account.accountId, session);
+      saveSessionSafely(sessionStore, account.accountId, session, 'clear invalid resume before retry');
       const retryResult = await claudeQuery(queryOptions);
       Object.assign(result, retryResult);
     }
@@ -917,8 +1026,7 @@ async function sendToClaude(
 
     // Update session with new SDK session ID
     session.sdkSessionId = result.sessionId || undefined;
-    session.state = 'idle';
-    sessionStore.save(account.accountId, session);
+    saveSessionSafely(sessionStore, account.accountId, session, 'save sendToClaude session id');
 
     // Auto-push deliverable files mentioned in Claude's response
     if (result.text) {
@@ -967,11 +1075,10 @@ async function sendToClaude(
       logger.error('Error in sendToClaude', { error: errorMsg });
       await sender.sendText(fromUserId, contextToken, '处理消息时出错，请稍后重试。');
     }
-    session.state = 'idle';
-    sessionStore.save(account.accountId, session);
   } finally {
     clearInterval(flushTimer);
     stopTyping();
+    resetSessionStateSafely(sessionStore, account.accountId, session, 'sendToClaude finally');
     // Clean up the abort controller if it's still ours
     if (activeControllers.get(account.accountId) === abortController) {
       activeControllers.delete(account.accountId);

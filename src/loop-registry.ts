@@ -5,6 +5,8 @@ import { loadJson, saveJson } from './store.js';
 const LOOPS_PATH = join(homedir(), '.wechat-claude-code', 'loops.json');
 const MAX_LOOPS = 20;
 const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
+export const MIN_LOOP_INTERVAL_MS = 60_000;
+export const MAX_LOOP_INTERVAL_MS = 30 * 24 * 60 * 60 * 1000;
 
 export interface LoopEntry {
   id: string;
@@ -24,16 +26,31 @@ export interface LoopEntry {
 // ---------------------------------------------------------------------------
 
 export function parseInterval(token: string): number | null {
-  const m = token.trim().match(/^(\d+(?:\.\d+)?)\s*(s|m|h|d)$/i);
+  const m = token.trim().match(/^(-?\d+(?:\.\d+)?)\s*(s|m|h|d)$/i);
   if (!m) return null;
   const n = parseFloat(m[1]);
+  if (!Number.isFinite(n) || n <= 0) return null;
+
+  let intervalMs: number;
   switch (m[2].toLowerCase()) {
-    case 's': return Math.max(60_000, Math.round(n * 1_000));      // min 1 min
-    case 'm': return Math.round(n * 60_000);
-    case 'h': return Math.round(n * 3_600_000);
-    case 'd': return Math.round(n * 86_400_000);
+    case 's':
+      intervalMs = Math.round(n * 1_000);
+      break;
+    case 'm':
+      intervalMs = Math.round(n * 60_000);
+      break;
+    case 'h':
+      intervalMs = Math.round(n * 3_600_000);
+      break;
+    case 'd':
+      intervalMs = Math.round(n * 86_400_000);
+      break;
+    default:
+      return null;
   }
-  return null;
+  if (intervalMs > MAX_LOOP_INTERVAL_MS) return null;
+  // Keep the existing 1 minute floor so very short loops cannot hammer the process.
+  return Math.max(MIN_LOOP_INTERVAL_MS, intervalMs);
 }
 
 export function formatInterval(ms: number): string {
@@ -58,7 +75,12 @@ function genId(): string {
 export function loadLoops(): LoopEntry[] {
   const now = Date.now();
   const all = loadJson<LoopEntry[]>(LOOPS_PATH, []);
-  return all.filter(l => now - l.createdAt < SEVEN_DAYS_MS);
+  const pruned = all.filter(l => now - l.createdAt < SEVEN_DAYS_MS);
+  if (pruned.length !== all.length) {
+    // Persist pruning on load so expired entries do not consume MAX_LOOPS slots.
+    saveLoops(pruned);
+  }
+  return pruned;
 }
 
 export function saveLoops(loops: LoopEntry[]): void {

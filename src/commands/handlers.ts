@@ -2,7 +2,7 @@ import type { CommandContext, CommandResult } from './router.js';
 import { scanAllSkills, formatSkillList, findSkill, type SkillInfo } from '../claude/skill-scanner.js';
 import { loadConfig, saveConfig } from '../config.js';
 import { DEFAULT_WORKING_DIR } from '../constants.js';
-import { readFileSync, existsSync, statSync, readdirSync } from 'node:fs';
+import { readFileSync, existsSync, statSync, readdirSync, realpathSync } from 'node:fs';
 import type { PendingSetup } from '../session.js';
 import {
   loadWorkspaceConfigs,
@@ -23,10 +23,12 @@ import {
   getLoopsForAccount,
   removeLoop,
   removeAllLoops,
+  MAX_LOOP_INTERVAL_MS,
 } from '../loop-registry.js';
-import { resolve, basename, join, extname } from 'node:path';
+import { resolve, basename, join, extname, relative, delimiter } from 'node:path';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { logger } from '../logger.js';
 
 const HELP_TEXT = `📋 可用命令
 
@@ -91,6 +93,14 @@ const HELP_TEXT = `📋 可用命令
 let cachedSkills: SkillInfo[] | null = null;
 let lastScanTime = 0;
 const CACHE_TTL = 60_000; // 60秒
+const SENDABLE_EXTENSIONS = new Set([
+  '.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg', '.ico',
+  '.pdf', '.doc', '.docx', '.ppt', '.pptx', '.rtf',
+  '.txt', '.md', '.csv', '.xlsx', '.xls',
+  '.mp3', '.wav', '.m4a', '.mp4', '.mov',
+  '.zip', '.tar', '.gz', '.json', '.ts', '.js', '.py',
+]);
+const LOOP_INTERVAL_TOKEN_RE = /^(-?\d+(?:\.\d+)?)\s*(s|m|h|d)$/i;
 
 function getSkills(): SkillInfo[] {
   const now = Date.now();
@@ -261,6 +271,59 @@ export function handlePrompt(_ctx: CommandContext, args: string): CommandResult 
   return { reply: `✅ 系统提示词已设置:\n${config.systemPrompt}`, handled: true };
 }
 
+function resolveSendPath(workingDirectory: string, input: string): string {
+  const clean = input.replace(/^["']|["']$/g, '');
+  if (clean.startsWith('/')) return resolve(clean);
+  return resolve(workingDirectory, clean.replace(/^~/, homedir()));
+}
+
+function normalizeAllowedRoot(root: string): string {
+  const expanded = resolve(root.replace(/^~/, homedir()));
+  return existsSync(expanded) ? realpathSync(expanded) : expanded;
+}
+
+function isPathWithinRoot(candidatePath: string, rootPath: string): boolean {
+  const rel = relative(rootPath, candidatePath);
+  return rel === '' || (!rel.startsWith('..') && !rel.startsWith(`..${process.platform === 'win32' ? '\\' : '/'}`));
+}
+
+function getAllowedSendRoots(ctx: CommandContext): string[] {
+  const configured = (process.env.WECHAT_CLAUDE_ALLOWED_SEND_ROOTS ?? '')
+    .split(delimiter)
+    .map(root => root.trim())
+    .filter(Boolean);
+  const roots = [ctx.session.workingDirectory || DEFAULT_WORKING_DIR, ...configured];
+  return Array.from(new Set(roots.map(normalizeAllowedRoot)));
+}
+
+function findBlockedSendPaths(paths: string[], allowedRoots: string[]): string[] {
+  return paths.filter((filePath) => {
+    const canonicalPath = realpathSync(filePath);
+    return !allowedRoots.some(root => isPathWithinRoot(canonicalPath, root));
+  });
+}
+
+function getLoopIntervalError(token: string): string | null {
+  const trimmed = token.trim();
+  const match = trimmed.match(LOOP_INTERVAL_TOKEN_RE);
+  if (!match) {
+    return '间隔格式无效，支持: 30s / 5m / 2h / 1d（最小 1 分钟，最大 30 天）';
+  }
+  const value = Number.parseFloat(match[1]);
+  if (!Number.isFinite(value)) {
+    return '间隔必须是有效数字，支持单位: s / m / h / d';
+  }
+  if (value <= 0) {
+    return '间隔必须大于 0。';
+  }
+  const unit = match[2].toLowerCase();
+  const multiplier = unit === 's' ? 1_000 : unit === 'm' ? 60_000 : unit === 'h' ? 3_600_000 : 86_400_000;
+  if (value * multiplier > MAX_LOOP_INTERVAL_MS) {
+    return `间隔过长，最大支持 ${formatInterval(MAX_LOOP_INTERVAL_MS)}。`;
+  }
+  return null;
+}
+
 export function handleSend(ctx: CommandContext, args: string): CommandResult {
   if (!args) {
     return {
@@ -279,33 +342,35 @@ export function handleSend(ctx: CommandContext, args: string): CommandResult {
 
   // 解析多路径（按空格分隔，支持路径含空格则需引号，但简单情况不需要）
   const rawPaths = args.match(/"[^"]+"|'[^']+'|\S+/g) || [];
-  const resolved = rawPaths.map(p => {
-    const clean = p.replace(/^["']|["']$/g, '');
-    if (clean.startsWith('/')) return clean;
-    return resolve(ctx.session.workingDirectory, clean.replace(/^~/, homedir()));
-  });
+  const resolved = rawPaths.map(p => resolveSendPath(ctx.session.workingDirectory, p));
 
   const notFound = resolved.filter(p => !existsSync(p));
   if (notFound.length > 0) {
     return { reply: `文件不存在:\n${notFound.map(p => '  ' + p).join('\n')}`, handled: true };
   }
 
+  const allowedRoots = getAllowedSendRoots(ctx);
+  const blockedInputs = findBlockedSendPaths(resolved, allowedRoots);
+  if (blockedInputs.length > 0) {
+    return {
+      reply: [
+        '以下路径已被拦截：/send-me 只能读取当前 workspace 或白名单目录下的文件。',
+        '',
+        ...blockedInputs.map(p => `  ${p}`),
+      ].join('\n'),
+      handled: true,
+    };
+  }
+
   // 展开目录
   const files: string[] = [];
-  const SENDABLE = new Set([
-    '.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.svg', '.ico',
-    '.pdf', '.doc', '.docx', '.ppt', '.pptx', '.rtf',
-    '.txt', '.md', '.csv', '.xlsx', '.xls',
-    '.mp3', '.wav', '.m4a', '.mp4', '.mov',
-    '.zip', '.tar', '.gz', '.json', '.ts', '.js', '.py',
-  ]);
   for (const p of resolved) {
     const st = statSync(p);
     if (st.isDirectory()) {
       const entries = readdirSync(p);
       const dirFiles = entries
         .map(e => `${p}/${e}`)
-        .filter(f => { try { return statSync(f).isFile() && SENDABLE.has(extname(f).toLowerCase()); } catch { return false; } });
+        .filter(f => { try { return statSync(f).isFile() && SENDABLE_EXTENSIONS.has(extname(f).toLowerCase()); } catch { return false; } });
       if (dirFiles.length === 0) {
         return { reply: `目录为空或没有可发送的文件: ${p}`, handled: true };
       }
@@ -316,6 +381,18 @@ export function handleSend(ctx: CommandContext, args: string): CommandResult {
       }
       files.push(p);
     }
+  }
+
+  const blockedExpanded = findBlockedSendPaths(files, allowedRoots);
+  if (blockedExpanded.length > 0) {
+    return {
+      reply: [
+        '以下文件已被拦截：检测到目录内文件或符号链接指向 workspace/白名单之外的位置。',
+        '',
+        ...blockedExpanded.map(p => `  ${p}`),
+      ].join('\n'),
+      handled: true,
+    };
   }
 
   if (files.length === 1) {
@@ -529,7 +606,6 @@ function loadSessionIndex(cwd: string): SessionIndexEntry[] {
   }
 
   // Fallback: scan .jsonl files directly (happens when only one session exists)
-  if (!existsSync(projectDir)) return [];
   try {
     const files = readdirSync(projectDir);
     const entries: SessionIndexEntry[] = files
@@ -559,7 +635,17 @@ function loadSessionIndex(cwd: string): SessionIndexEntry[] {
         new Date(b.modified).getTime() - new Date(a.modified).getTime()
       );
     return entries;
-  } catch {
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'EACCES') {
+      // Missing or unreadable Claude project dirs should behave like "no sessions found".
+      return [];
+    }
+    logger.warn('loadSessionIndex scan failed', {
+      cwd,
+      projectDir,
+      error: err instanceof Error ? err.message : String(err),
+    });
     return [];
   }
 }
@@ -1029,11 +1115,23 @@ export function handleLoop(ctx: CommandContext, args: string): CommandResult {
 
   // /loop <interval> <prompt> — 解析间隔
   const parts = trimmed.split(/\s+/);
+  const intervalError = getLoopIntervalError(parts[0] ?? '');
+  if (intervalError) {
+    return {
+      reply: [
+        intervalError,
+        '',
+        '用法: /loop <间隔> <提示>',
+        '例:   /loop 5m 检查 CI 是否通过',
+      ].join('\n'),
+      handled: true,
+    };
+  }
   const intervalMs = parseInterval(parts[0]);
   if (!intervalMs) {
     return {
       reply: [
-        '间隔格式无效，支持: 30s / 5m / 2h / 1d（最小 1 分钟）',
+        '间隔格式无效，支持: 30s / 5m / 2h / 1d（最小 1 分钟，最大 30 天）',
         '',
         '用法: /loop <间隔> <提示>',
         '例:   /loop 5m 检查 CI 是否通过',

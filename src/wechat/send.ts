@@ -7,6 +7,9 @@ import { uploadFile } from './upload.js';
 import { logger } from '../logger.js';
 
 const TYPING_KEEPALIVE_MS = 5_000;
+const TYPING_REQUEST_TIMEOUT_MS = 12_000;
+const TYPING_CANCEL_TIMEOUT_MS = 3_000;
+const SEND_FILE_RATE_LIMIT_RETRY_DELAYS_MS = [500, 1_000, 2_000];
 
 export function createSender(api: WeChatApi, botAccountId: string) {
   let clientCounter = 0;
@@ -17,13 +20,13 @@ export function createSender(api: WeChatApi, botAccountId: string) {
     return `wcc-${Date.now()}-${++clientCounter}`;
   }
 
-  async function getTypingTicket(userId: string, contextToken?: string): Promise<string> {
+  async function getTypingTicket(userId: string, contextToken?: string, signal?: AbortSignal): Promise<string> {
     const cached = typingTicketCache.get(userId);
     if (cached && Date.now() - cached.fetchedAt < TICKET_TTL) {
       return cached.ticket;
     }
     try {
-      const resp = await api.getConfig(userId, contextToken);
+      const resp = await api.getConfig(userId, contextToken, signal);
       if (resp.ret === 0 && resp.typing_ticket) {
         typingTicketCache.set(userId, { ticket: resp.typing_ticket, fetchedAt: Date.now() });
         return resp.typing_ticket;
@@ -41,45 +44,60 @@ export function createSender(api: WeChatApi, botAccountId: string) {
    */
   function startTyping(toUserId: string, contextToken: string): () => void {
     let cancelled = false;
+    const controller = new AbortController();
 
-    (async () => {
-      const ticket = await getTypingTicket(toUserId, contextToken);
-      if (!ticket || cancelled) return;
-
+    void (async () => {
+      let ticket = '';
+      let typingStarted = false;
       try {
-        await api.sendTyping({
+        ticket = await withAbortableTimeout(
+          getTypingTicket(toUserId, contextToken, controller.signal),
+          controller.signal,
+          TYPING_REQUEST_TIMEOUT_MS,
+          'getTypingTicket',
+        );
+        if (!ticket || cancelled) return;
+
+        await withAbortableTimeout(api.sendTyping({
           ilink_user_id: toUserId,
           typing_ticket: ticket,
           status: TypingStatus.TYPING,
-        });
+        }, controller.signal), controller.signal, TYPING_REQUEST_TIMEOUT_MS, 'sendTyping start');
+        typingStarted = true;
       } catch (err) {
+        if (isAbortLikeError(err)) {
+          return;
+        }
         logger.debug('sendTyping start failed', { err: err instanceof Error ? err.message : String(err) });
         return;
       }
 
       // Keepalive loop
-      while (!cancelled) {
-        await new Promise(r => setTimeout(r, TYPING_KEEPALIVE_MS));
-        if (cancelled) break;
+      while (!controller.signal.aborted) {
+        await sleepWithSignal(TYPING_KEEPALIVE_MS, controller.signal);
+        if (controller.signal.aborted) break;
         try {
-          await api.sendTyping({
+          await withAbortableTimeout(api.sendTyping({
             ilink_user_id: toUserId,
             typing_ticket: ticket,
             status: TypingStatus.TYPING,
-          });
-        } catch {
+          }, controller.signal), controller.signal, TYPING_REQUEST_TIMEOUT_MS, 'sendTyping keepalive');
+        } catch (err) {
+          if (isAbortLikeError(err)) {
+            break;
+          }
           break;
         }
       }
 
       // Send CANCEL to tell WeChat we're done typing
-      if (!ticket) return;
+      if (!ticket || !typingStarted || !cancelled) return;
       try {
-        await api.sendTyping({
+        await withTimeout(api.sendTyping({
           ilink_user_id: toUserId,
           typing_ticket: ticket,
           status: TypingStatus.CANCEL,
-        });
+        }), TYPING_CANCEL_TIMEOUT_MS, 'sendTyping cancel');
       } catch {
         // ignore
       }
@@ -87,6 +105,7 @@ export function createSender(api: WeChatApi, botAccountId: string) {
 
     return () => {
       cancelled = true;
+      controller.abort();
     };
   }
 
@@ -202,12 +221,24 @@ export function createSender(api: WeChatApi, botAccountId: string) {
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         if (msg.includes('rate-limited')) {
-          // Back off and retry once
-          await new Promise(r => setTimeout(r, 15_000));
-          try {
-            await sendFile(toUserId, contextToken, filePath);
-            sent++;
-          } catch {
+          let delivered = false;
+          // Small exponential retry steps handle transient per-user send throttles
+          // without turning large batches into multi-minute stalls.
+          for (const delayMs of SEND_FILE_RATE_LIMIT_RETRY_DELAYS_MS) {
+            await new Promise(r => setTimeout(r, delayMs));
+            try {
+              await sendFile(toUserId, contextToken, filePath);
+              sent++;
+              delivered = true;
+              break;
+            } catch (retryErr) {
+              const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
+              if (!retryMsg.includes('rate-limited')) {
+                break;
+              }
+            }
+          }
+          if (!delivered) {
             failed.push(filePath);
           }
         } else {
@@ -255,4 +286,60 @@ export function expandPaths(paths: string[]): string[] {
     }
   }
   return result;
+}
+
+function isAbortLikeError(err: unknown): boolean {
+  if (err instanceof DOMException && err.name === 'AbortError') {
+    return true;
+  }
+  return err instanceof Error && (err.message === 'aborted' || err.message.includes('timed out'));
+}
+
+function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) => {
+      setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+    }),
+  ]);
+}
+
+function withAbortableTimeout<T>(
+  promise: Promise<T>,
+  signal: AbortSignal,
+  timeoutMs: number,
+  label: string,
+): Promise<T> {
+  return Promise.race([
+    promise,
+    waitForAbort(signal),
+    new Promise<T>((_, reject) => {
+      setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs);
+    }),
+  ]);
+}
+
+function waitForAbort(signal: AbortSignal): Promise<never> {
+  return new Promise((_, reject) => {
+    if (signal.aborted) {
+      reject(new Error('aborted'));
+      return;
+    }
+    signal.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+  });
+}
+
+function sleepWithSignal(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted) {
+      resolve();
+      return;
+    }
+
+    const timer = setTimeout(resolve, ms);
+    signal.addEventListener('abort', () => {
+      clearTimeout(timer);
+      resolve();
+    }, { once: true });
+  });
 }

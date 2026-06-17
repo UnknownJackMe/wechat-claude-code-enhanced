@@ -68,7 +68,7 @@ export async function uploadFile(
   logger.info('Upload URL response', { uploadResp });
 
   if (!uploadResp.upload_full_url && !uploadResp.upload_param) {
-    throw new Error(`获取上传地址失败: ${JSON.stringify(uploadResp)}`);
+    throw new Error(`获取上传地址失败: ${sanitizeErrorMessage(JSON.stringify(uploadResp))}`);
   }
 
   // Encrypt
@@ -82,7 +82,7 @@ export async function uploadFile(
     uploadUrl = `${CDN_BASE_URL}/upload?encrypted_query_param=${encodeURIComponent(uploadResp.upload_param!)}&filekey=${fileKey}`;
   }
 
-  logger.info('Uploading to CDN', { uploadUrl, encryptedSize: encrypted.length });
+  logger.info('Uploading to CDN', { uploadUrl: sanitizeErrorMessage(uploadUrl), encryptedSize: encrypted.length });
 
   // Upload to CDN (POST, get download param from response header)
   const encryptQueryParam = await uploadToCdn(uploadUrl, encrypted);
@@ -116,7 +116,7 @@ async function uploadToCdn(url: string, encrypted: Buffer): Promise<string> {
 
       if (res.status >= 400 && res.status < 500) {
         const text = await res.text();
-        throw new Error(`CDN 上传失败 (4xx): ${res.status} ${text.slice(0, 200)}`);
+        throw new Error(`CDN 上传失败 (4xx): ${res.status} ${sanitizeErrorMessage(text.slice(0, 200))}`);
       }
 
       if (res.status >= 500) {
@@ -141,4 +141,15 @@ async function uploadToCdn(url: string, encrypted: Buffer): Promise<string> {
   }
 
   throw new Error('CDN 上传失败: 多次重试后仍失败');
+}
+
+function sanitizeErrorMessage(message: string): string {
+  return message.replace(/https?:\/\/[^\s'")]+/g, (rawUrl) => {
+    try {
+      const url = new URL(rawUrl);
+      return `${url.origin}${url.pathname}`;
+    } catch {
+      return rawUrl.replace(/\?.*$/, '');
+    }
+  });
 }

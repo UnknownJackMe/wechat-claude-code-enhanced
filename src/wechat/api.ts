@@ -54,9 +54,12 @@ export class WeChatApi {
     path: string,
     body: unknown,
     timeoutMs: number = 15_000,
+    externalSignal?: AbortSignal,
   ): Promise<T> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const abortFromCaller = () => controller.abort();
+    externalSignal?.addEventListener('abort', abortFromCaller, { once: true });
 
     const url = `${this.baseUrl}/${path}`;
 
@@ -80,11 +83,15 @@ export class WeChatApi {
       return json;
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') {
+        if (externalSignal?.aborted) {
+          throw err;
+        }
         throw new Error(`Request to ${url} timed out after ${timeoutMs}ms`);
       }
       throw err;
     } finally {
       clearTimeout(timer);
+      externalSignal?.removeEventListener('abort', abortFromCaller);
     }
   }
 
@@ -134,17 +141,18 @@ export class WeChatApi {
   }
 
   /** Fetch bot config (includes typing_ticket). */
-  async getConfig(ilinkUserId: string, contextToken?: string): Promise<GetConfigResp> {
+  async getConfig(ilinkUserId: string, contextToken?: string, signal?: AbortSignal): Promise<GetConfigResp> {
     return this.request<GetConfigResp>(
       'ilink/bot/getconfig',
       { ilink_user_id: ilinkUserId, context_token: contextToken },
       10_000,
+      signal,
     );
   }
 
   /** Send a typing indicator to a user. */
-  async sendTyping(req: SendTypingReq): Promise<void> {
-    await this.request('ilink/bot/sendtyping', req, 10_000);
+  async sendTyping(req: SendTypingReq, signal?: AbortSignal): Promise<void> {
+    await this.request('ilink/bot/sendtyping', req, 10_000, signal);
   }
 
   /** Get a presigned upload URL for media files. */

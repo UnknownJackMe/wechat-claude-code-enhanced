@@ -21,7 +21,7 @@ export async function downloadAndDecrypt(
     response = await fetch(url, { signal: controller.signal });
   } catch (err) {
     clearTimeout(timer);
-    throw new Error(`CDN download failed: ${err instanceof Error ? err.message : String(err)}`);
+    throw new Error(`CDN download failed: ${sanitizeErrorMessage(err instanceof Error ? err.message : String(err))}`);
   }
   clearTimeout(timer);
 
@@ -50,4 +50,15 @@ export async function downloadAndDecrypt(
   logger.info("CDN download and decrypt succeeded", { size: decrypted.length });
 
   return decrypted;
+}
+
+function sanitizeErrorMessage(message: string): string {
+  return message.replace(/https?:\/\/[^\s'")]+/g, (rawUrl) => {
+    try {
+      const url = new URL(rawUrl);
+      return `${url.origin}${url.pathname}`;
+    } catch {
+      return rawUrl.replace(/\?.*$/, '');
+    }
+  });
 }

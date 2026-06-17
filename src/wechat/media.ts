@@ -6,6 +6,8 @@ import { MessageItemType } from './types.js';
 import { downloadAndDecrypt } from './cdn.js';
 import { logger } from '../logger.js';
 
+const MAX_IMAGE_DOWNLOAD_SIZE = 10 * 1024 * 1024;
+
 function detectMimeType(data: Buffer): string {
   if (data[0] === 0x89 && data[1] === 0x50) return 'image/png';
   if (data[0] === 0xFF && data[1] === 0xD8) return 'image/jpeg';
@@ -62,6 +64,9 @@ export async function downloadImage(item: MessageItem): Promise<string | null> {
 
   try {
     const decrypted = await downloadAndDecrypt(cdnData.encryptQueryParam, cdnData.aesKey);
+    if (decrypted.length > MAX_IMAGE_DOWNLOAD_SIZE) {
+      throw new Error(`Image download too large to inline: ${Math.round(decrypted.length / 1024 / 1024)}MB exceeds 10MB limit`);
+    }
     const mimeType = detectMimeType(decrypted);
     const base64 = decrypted.toString('base64');
     const dataUri = `data:${mimeType};base64,${base64}`;
