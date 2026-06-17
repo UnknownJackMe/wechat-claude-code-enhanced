@@ -11,10 +11,11 @@ import { saveAccount, loadLatestAccount, type AccountData } from './wechat/accou
 import { startQrLogin, waitForQrScan } from './wechat/login.js';
 import { createMonitor, type MonitorCallbacks } from './wechat/monitor.js';
 import { createSender } from './wechat/send.js';
-import { downloadImage, extractText, extractFirstImageUrl, extractFirstFileItem, downloadFile, downloadAllMedia } from './wechat/media.js';
+import { downloadImage, extractText, extractFirstImageUrl, extractFirstFileItem, extractFirstVoiceItem, downloadFile, downloadAllMedia } from './wechat/media.js';
 import { createSessionStore, type Session } from './session.js';
 import { routeCommand, handleSetupWizard, type CommandContext, type CommandResult } from './commands/router.js';
 import { claudeQuery, type QueryOptions } from './claude/provider.js';
+import { transcribeVoice } from './wechat/voice-transcribe.js';
 import { loadConfig, saveConfig } from './config.js';
 import { logger } from './logger.js';
 import { DATA_DIR } from './constants.js';
@@ -522,9 +523,30 @@ async function handleMessage(
   sharedCtx.lastContextToken = contextToken;
 
   // Extract text from items
-  const userText = extractTextFromItems(msg.item_list);
+  let userText = extractTextFromItems(msg.item_list);
   const imageItem = extractFirstImageUrl(msg.item_list);
   const fileItem = extractFirstFileItem(msg.item_list);
+  const voiceItem = extractFirstVoiceItem(msg.item_list);
+
+  // Voice → transcribe locally with mlx_whisper, echo the result, then treat as text
+  if (voiceItem && !userText) {
+    const stopVoiceTyping = sender.startTyping(fromUserId, contextToken);
+    let transcript: string | null = null;
+    try {
+      transcript = await transcribeVoice(voiceItem);
+    } catch (err) {
+      logger.warn('transcribeVoice threw', { error: err instanceof Error ? err.message : String(err) });
+    } finally {
+      stopVoiceTyping();
+    }
+    if (transcript) {
+      await sender.sendText(fromUserId, contextToken, `🎤 识别为：${transcript}`);
+      userText = transcript;
+    } else {
+      await sender.sendText(fromUserId, contextToken, '🎤 语音没识别出文字，请重发或直接打字。');
+      return;
+    }
+  }
 
   // Drop non-command messages while processing (priority commands already handled upstream)
   if (session.state === 'processing' && !userText.startsWith('/')) {

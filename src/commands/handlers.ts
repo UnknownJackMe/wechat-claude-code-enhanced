@@ -18,6 +18,12 @@ import {
   deleteAlias,
 } from '../model-aliases.js';
 import {
+  loadQuickCommands,
+  resolveQuickCommand,
+  upsertQuickCommand,
+  deleteQuickCommand,
+} from '../quick-commands.js';
+import {
   parseInterval,
   formatInterval,
   getLoopsForAccount,
@@ -58,6 +64,10 @@ const HELP_TEXT = `📋 可用命令
                     opus / sonnet / fable / off
 
 ━━━ 任务控制 ━━━
+/q                  列出所有快捷指令
+/q <名字>           执行快捷指令
+/q set <名字> <内容> 添加/更新快捷指令
+/q del <名字>        删除快捷指令
 /goal [条件]        设置目标，Claude 持续工作直到条件满足
 /goal clear         清除当前目标
 /loop <间隔> <提示> 定时循环执行，例: /loop 5m 检查 CI
@@ -86,6 +96,7 @@ const HELP_TEXT = `📋 可用命令
 
 提示：/send-you 支持一次发送多张图片和多个文件，
 图片会被 Claude 直接识别，文件会被自动读取。
+发送语音消息会用本地模型转成文字再交给 Claude。
 
 直接输入文字即可与 Claude Code 对话`;
 
@@ -407,6 +418,75 @@ export function handleSendMe(ctx: CommandContext, args: string): CommandResult {
 }
 
 /** /model-config — 管理模型别名 */
+/** /q — 快捷指令 / 常用语 */
+export function handleQuick(_ctx: CommandContext, args: string): CommandResult {
+  const trimmed = args.trim();
+
+  // /q  — 列出所有快捷指令
+  if (!trimmed) {
+    const commands = loadQuickCommands();
+    const entries = Object.entries(commands);
+    if (entries.length === 0) {
+      return {
+        reply: [
+          '⚡ 快捷指令列表（空）',
+          '',
+          '用法:',
+          '  /q set <名字> <内容>  — 添加/更新',
+          '  /q <名字>            — 执行',
+          '  /q del <名字>         — 删除',
+          '',
+          '例: /q test 运行所有测试并报告结果',
+        ].join('\n'),
+        handled: true,
+      };
+    }
+    const lines = ['⚡ 快捷指令列表', ''];
+    for (const [name, prompt] of entries) {
+      lines.push(`/q ${name}`);
+      lines.push(`  ${prompt}`);
+    }
+    lines.push('');
+    lines.push('用 /q <名字> 执行，/q del <名字> 删除');
+    return { reply: lines.join('\n'), handled: true };
+  }
+
+  const parts = trimmed.split(/\s+/);
+  const sub = parts[0].toLowerCase();
+
+  // /q set <名字> <内容>
+  if (sub === 'set') {
+    const name = parts[1];
+    const prompt = parts.slice(2).join(' ');
+    if (!name || !prompt) {
+      return { reply: '用法: /q set <名字> <内容>\n例: /q set test 运行所有测试并报告结果', handled: true };
+    }
+    upsertQuickCommand(name, prompt);
+    return {
+      reply: [`✅ 快捷指令已保存`, '', `/q ${name.toLowerCase()}`, `  ${prompt}`].join('\n'),
+      handled: true,
+    };
+  }
+
+  // /q del <名字>
+  if (sub === 'del') {
+    const name = parts[1];
+    if (!name) return { reply: '用法: /q del <名字>', handled: true };
+    const deleted = deleteQuickCommand(name);
+    return { reply: deleted ? `✅ 已删除快捷指令: ${name}` : `❌ 快捷指令不存在: ${name}`, handled: true };
+  }
+
+  // /q <名字>  — 执行：把存的内容作为 prompt 发给 Claude
+  const prompt = resolveQuickCommand(parts[0]);
+  if (!prompt) {
+    return { reply: `❌ 快捷指令不存在: ${parts[0]}\n\n用 /q 查看所有快捷指令`, handled: true };
+  }
+  // 允许附加参数：/q test --verbose → "运行所有测试 --verbose"
+  const extra = parts.slice(1).join(' ');
+  const finalPrompt = extra ? `${prompt} ${extra}` : prompt;
+  return { handled: true, claudePrompt: finalPrompt };
+}
+
 export function handleModelConfig(_ctx: CommandContext, args: string): CommandResult {
   const parts = args.trim().split(/\s+/);
 

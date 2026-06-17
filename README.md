@@ -141,6 +141,42 @@
 
 ---
 
+### 语音输入 — 本地模型转文字
+
+直接在微信里发语音，自动转成文字交给 Claude。人在外面不方便打字时尤其好用。
+
+- 收到语音 → 本地转录 → 先回显 `🎤 识别为：...` → 再作为文字发给 Claude
+- 全程**本地运行**，语音内容不经过第三方云服务
+
+技术实现：微信语音是腾讯 SILK v3 格式（ffmpeg 不支持），处理链路为
+`下载解密 → pilk 解码成 PCM → ffmpeg 封装 wav → mlx_whisper 转录`。
+转录模型用 `mlx-community/whisper-large-v3-mlx`（Apple Silicon 原生加速，中英文俱佳）。
+
+依赖（macOS）：
+```bash
+pip install pilk          # SILK 编解码
+brew install ffmpeg       # 音频封装
+pip install mlx-whisper   # Apple Silicon 上的 whisper
+```
+所有外部程序均通过绝对路径探测，兼容 launchd 守护进程与终端 PATH 不一致的情况。
+
+---
+
+### `/q` — 快捷指令 / 常用语
+
+把常用需求存成短指令，一句话触发，省去重复打字。
+
+```
+/q                       — 列出所有快捷指令
+/q set test 运行所有测试并报告结果   — 添加/更新
+/q test                  — 执行（把存的内容作为 prompt 发给 Claude）
+/q del test              — 删除
+```
+
+支持附加参数：`/q test --verbose` 会把 `--verbose` 拼到指令内容后面。数据存储在 `~/.wechat-claude-code/quick-commands.json`。
+
+---
+
 ## 安装
 
 ```bash
@@ -184,6 +220,10 @@ npm run daemon -- logs       # 查看日志
 /advisor [模型]     查看或设置 Advisor 模型（opus/sonnet/fable/off）
 
 ━━━ 任务控制 ━━━
+/q                  列出所有快捷指令
+/q <名字>           执行快捷指令
+/q set <名字> <内容> 添加/更新快捷指令
+/q del <名字>        删除快捷指令
 /goal [条件]        设置目标，Claude 持续工作直到条件满足
 /goal clear         清除当前目标
 /loop <间隔> <提示> 定时循环执行，例: /loop 5m 检查 CI
@@ -207,6 +247,8 @@ npm run daemon -- logs       # 查看日志
 /skills [full]      列出已安装的 skill
 /version            查看版本信息
 ```
+
+直接发送语音消息会用本地模型（mlx_whisper）转成文字再交给 Claude。
 
 ## 致谢
 
