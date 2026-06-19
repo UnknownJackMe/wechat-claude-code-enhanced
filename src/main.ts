@@ -67,20 +67,20 @@ function resolveApproval(accountId: string, behavior: 'allow' | 'deny', message?
 
 /** Build a concise, readable WeChat message describing a tool-permission request. */
 function formatApprovalRequest(req: PermissionRequest): string {
-  const lines = ['🔐 需要你确认操作', '', `工具: ${req.toolName}`];
+  const lines = ['**🔐 需要确认操作**', '', `**工具** ${req.toolName}`];
   const input = req.input ?? {};
-  // Surface the most useful field per common tool, fall back to compact JSON.
   if (typeof input.command === 'string') {
-    lines.push('', `命令:\n  ${input.command}`);
-    if (input.description) lines.push('', `说明: ${input.description}`);
+    lines.push('', `**命令**`);
+    lines.push('`' + input.command + '`');
+    if (input.description) lines.push('', input.description);
   } else if (typeof input.file_path === 'string') {
-    lines.push('', `文件:\n  ${input.file_path}`);
+    lines.push('', `**文件** ${input.file_path}`);
   } else {
     const json = JSON.stringify(input);
-    lines.push('', `参数:\n  ${json.length > 400 ? json.slice(0, 400) + '…' : json}`);
+    lines.push('', `**参数** ${json.length > 400 ? json.slice(0, 400) + '…' : json}`);
   }
-  if (req.decisionReason) lines.push('', `原因: ${req.decisionReason}`);
-  lines.push('', '回复 y 批准 / n 拒绝（30 秒内有效）');
+  if (req.decisionReason) lines.push('', `_${req.decisionReason}_`);
+  lines.push('', '回复 **y** 批准 / **n** 拒绝（30 秒有效）');
   return lines.join('\n');
 }
 
@@ -1085,7 +1085,7 @@ async function sendToClaude(
         join(tmpdir(), 'wechat-claude-code'),
       ],
       systemPrompt: [
-        '你正在通过微信与用户对话，不是在终端里。不要让用户去终端操作。如果用户需要文件，直接输出文件地址就行，会自动识别解析推送文件到用户的微信中。',
+        '你正在通过微信与用户对话，不是在终端里。不要让用户去终端操作。如果用户需要文件，直接输出文件地址就行，会自动识别解析推送文件到用户的微信中。微信支持 Markdown 渲染，请在回复中合理使用 **粗体**、列表（1. 或 -）、`---` 分割线来让内容更清晰，但不要过度使用，保持简洁。',
         config.systemPrompt,
       ].filter(Boolean).join('\n'),
       abortController,

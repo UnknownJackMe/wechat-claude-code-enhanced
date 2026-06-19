@@ -36,70 +36,75 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { logger } from '../logger.js';
 
-const HELP_TEXT = `📋 可用命令
+const HELP_TEXT = `**📋 可用命令**
 
-━━━ 会话管理 ━━━
-/help               显示帮助
-/status             查看当前会话状态
-/clear              清除当前会话（保留目录/模型设置）
-/reset              完全重置（恢复所有默认设置）
-/stop               停止当前对话并清空排队消息
-/compact            压缩上下文（保持 session ID，大幅减少 token）
-/history [数量]     查看对话记录（默认最近 20 条）
-/undo [数量]        撤销最近对话（默认 1 条）
+---
 
-━━━ 对话恢复 ━━━
-/resume             列出当前目录的历史对话
-/resume <编号>      恢复指定编号的历史对话
-/resume <uuid>      通过 session ID 恢复
+**会话管理**
+/help — 显示帮助
+/status — 查看当前会话状态
+/clear — 清除当前会话（保留目录/模型设置）
+/reset — 完全重置（恢复所有默认设置）
+/stop — 停止当前对话并清空排队消息
+/compact — 压缩上下文（保持 session ID）
+/history [数量] — 查看对话记录（默认 20 条）
+/undo [数量] — 撤销最近对话（默认 1 条）
 
-━━━ 模型配置 ━━━
-/model [别名/名称]  查看或切换模型
-/model-config       列出所有模型别名
-/model-config <别名> <完整模型ID>  添加/更新别名
-/model-config del <别名>           删除别名
-/mode [bypass|accept] 权限模式：全自动 / 逐个 y/n 确认
-/effort [级别]      查看或调整思考强度
-                    low / medium / high / xhigh / max
-/advisor [模型]     查看或设置 Advisor 模型
-                    opus / sonnet / fable / off
+---
 
-━━━ 任务控制 ━━━
-/q                  列出所有快捷指令
-/q <名字>           执行快捷指令
-/q set <名字> <内容> 添加/更新快捷指令
-/q del <名字>        删除快捷指令
-/goal [条件]        设置目标，Claude 持续工作直到条件满足
-/goal clear         清除当前目标
-/loop <间隔> <提示> 定时循环执行，例: /loop 5m 检查 CI
-/loop               列出所有运行中的 loop
-/loop stop <id>     停止指定 loop
-/loop stop all      停止所有 loop
+**对话恢复**
+/resume — 列出当前目录的历史对话
+/resume <编号> — 恢复指定编号的历史对话
+/resume <uuid> — 通过 session ID 恢复
 
-━━━ Workspace 配置 ━━━
-/configs                  列出所有 workspace 配置
-/set-config <编号>        向导式创建/编辑配置
-/switch-config <编号>     一键切换（目录+模型+session）
-/delete-config <编号>     删除配置
+---
 
-━━━ 工作目录与提示词 ━━━
-/cwd [路径]         查看或切换工作目录
-/prompt [内容]      查看或设置系统提示词（全局生效）
+**模型配置**
+/model [别名/名称] — 查看或切换模型（切换前自动验证）
+/model-config — 列出所有模型别名
+/model-config <别名> <完整模型ID> — 添加/更新别名
+/model-config del <别名> — 删除别名
+/mode [bypass|accept] — 权限模式：全自动 / 逐个 y/n 确认
+/effort [级别] — 思考强度：low / medium / high / xhigh / max
+/advisor [模型] — Advisor 模型：opus / sonnet / fable / off
 
-━━━ 文件与工具 ━━━
-/send-me <路径>     发送本地文件给你（支持多路径、目录）
-/send-you           开始接收你发来的文件/图片
-/send-you-end [要求] 结束接收，将文件+图片连同要求发给 Claude
-/send-you-cancel    取消文件接收
-/skills [full]      列出已安装的 skill
-/<skill> [参数]     触发已安装的 skill
-/version            查看版本信息
+---
 
-提示：/send-you 支持一次发送多张图片和多个文件，
-图片会被 Claude 直接识别，文件会被自动读取。
-发送语音消息会用本地模型转成文字再交给 Claude。
+**任务控制**
+/q — 列出所有快捷指令
+/q <名字> — 执行快捷指令
+/q set <名字> <内容> — 添加/更新快捷指令
+/q del <名字> — 删除快捷指令
+/goal [条件] — 设置目标，Claude 持续工作直到完成
+/goal clear — 清除当前目标
+/loop <间隔> <提示> — 定时循环，例: /loop 5m 检查 CI
+/loop — 列出所有运行中的 loop
+/loop stop <id> — 停止指定 loop
+/loop stop all — 停止所有 loop
 
-直接输入文字即可与 Claude Code 对话`;
+---
+
+**Workspace 配置**
+/configs — 列出所有 workspace 配置
+/set-config <编号> — 向导式创建/编辑配置
+/switch-config <编号> — 一键切换（目录+模型+session）
+/delete-config <编号> — 删除配置
+
+---
+
+**文件与工具**
+/cwd [路径] — 查看或切换工作目录
+/prompt [内容] — 查看或设置系统提示词
+/send-me <路径> — 发送本地文件给你（支持多路径、目录）
+/send-you — 开始接收你发来的文件/图片
+/send-you-end [要求] — 结束接收，将文件+图片发给 Claude
+/send-you-cancel — 取消文件接收
+/skills [full] — 列出已安装的 skill
+/version — 查看版本信息
+
+---
+
+💡 直接发文字即可与 Claude Code 对话，也支持发送语音（本地模型转文字）和图片。`;
 
 // 缓存 skill 列表，避免每次命令都扫描文件系统
 let cachedSkills: SkillInfo[] | null = null;
@@ -149,10 +154,11 @@ export function handleCwd(ctx: CommandContext, args: string): CommandResult {
 export function handleModel(ctx: CommandContext, args: string): CommandResult {
   if (!args) {
     const current = ctx.session.model || '（未设置，使用默认）';
-    return { reply: `当前模型: ${current}\n\n用法: /model <模型名称或别名>\n例: /model sonnet\n\n查看别名: /model-config`, handled: true };
+    return {
+      reply: `**当前模型**\n${current}\n\n用法: /model <模型名称或别名>\n例: /model sonnet\n\n查看别名: /model-config`,
+      handled: true,
+    };
   }
-  // Resolve alias, then ask main.ts to probe the model before committing the switch.
-  // (An invalid --model hangs silently, so we validate rather than trust the input.)
   const resolved = resolveModel(args);
   return { handled: true, validateModel: resolved };
 }
@@ -166,13 +172,13 @@ export function handleMode(ctx: CommandContext, args: string): CommandResult {
   if (!arg) {
     return {
       reply: [
-        '🔐 权限模式',
+        '**🔐 权限模式**',
         '',
-        `当前: ${curLabel}`,
+        `当前: **${curLabel}**`,
         '',
         '切换:',
-        '  /mode bypass  — 全自动，不再询问',
-        '  /mode accept  — 每个操作推送到微信，回复 y 批准 / n 拒绝',
+        '- /mode bypass — 全自动，不再询问',
+        '- /mode accept — 每个操作推送到微信，回复 y 批准 / n 拒绝',
       ].join('\n'),
       handled: true,
     };
@@ -180,16 +186,16 @@ export function handleMode(ctx: CommandContext, args: string): CommandResult {
 
   if (arg === 'bypass' || arg === 'b') {
     ctx.updateSession({ permissionMode: 'bypass' });
-    return { reply: '✅ 已切换为 bypass permissions on\n全自动执行，不再询问。', handled: true };
+    return { reply: '✅ **已切换为 bypass 模式**\n全自动执行，不再询问。', handled: true };
   }
   if (arg === 'accept' || arg === 'a' || arg === 'acceptedits') {
     ctx.updateSession({ permissionMode: 'approve' });
     return {
       reply: [
-        '✅ 已切换为 accept edits on',
+        '✅ **已切换为 accept 模式**',
         '',
-        '之后 Claude 每次要执行工具，会推送到微信，',
-        '回复 y 批准 / n 拒绝（30 秒内未回复自动拒绝）。',
+        '之后 Claude 每次要执行工具，会推送到微信。',
+        '回复 **y** 批准 / **n** 拒绝（30 秒未回复自动拒绝）。',
       ].join('\n'),
       handled: true,
     };
@@ -207,27 +213,24 @@ export function handleStatus(ctx: CommandContext): CommandResult {
     (c.sdkSessionId === s.sdkSessionId || (!c.sdkSessionId && !s.sdkSessionId))
   );
   const configLine = activeConfig
-    ? `配置: #${activeConfig.id} ${activeConfig.name}`
-    : `配置: 无（未使用 workspace 配置）`;
+    ? `#${activeConfig.id} ${activeConfig.name}`
+    : '无（未使用 workspace 配置）';
+
+  const modeLabel = (s.permissionMode ?? 'bypass') === 'approve' ? 'accept（逐个 y/n）' : 'bypass（全自动）';
 
   const lines = [
-    '📊 会话状态',
+    '**📊 会话状态**',
     '',
-    configLine,
+    `**配置** ${configLine}`,
+    `**目录** ${s.workingDirectory}`,
+    `**模型** ${s.model ?? '默认'}`,
+    `**思考** ${s.effort ?? '默认 (high)'}`,
+    `**Advisor** ${s.advisor ?? '未启用'}`,
+    `**权限** ${modeLabel}`,
+    `**状态** ${s.state}`,
     '',
-    `工作目录:\n  ${s.workingDirectory}`,
-    '',
-    `模型:\n  ${s.model ?? '默认'}`,
-    '',
-    `思考强度:\n  ${s.effort ?? '默认 (high)'}`,
-    '',
-    `Advisor:\n  ${s.advisor ?? '未启用'}`,
-    '',
-    `权限模式:\n  ${(s.permissionMode ?? 'bypass') === 'approve' ? 'accept edits（逐个 y/n）' : 'bypass（全自动）'}`,
-    '',
-    `会话 ID:\n  ${s.sdkSessionId ?? '无'}`,
-    '',
-    `状态: ${s.state}`,
+    `**Session ID**`,
+    s.sdkSessionId ?? '无',
   ];
   return { reply: lines.join('\n'), handled: true };
 }
@@ -472,22 +475,21 @@ export function handleQuick(_ctx: CommandContext, args: string): CommandResult {
     if (entries.length === 0) {
       return {
         reply: [
-          '⚡ 快捷指令列表（空）',
+          '**⚡ 快捷指令列表（空）**',
           '',
-          '用法:',
-          '  /q set <名字> <内容>  — 添加/更新',
-          '  /q <名字>            — 执行',
-          '  /q del <名字>         — 删除',
+          '- /q set <名字> <内容> — 添加/更新',
+          '- /q <名字> — 执行',
+          '- /q del <名字> — 删除',
           '',
-          '例: /q test 运行所有测试并报告结果',
+          '例: /q set test 运行所有测试并报告结果',
         ].join('\n'),
         handled: true,
       };
     }
-    const lines = ['⚡ 快捷指令列表', ''];
+    const lines = ['**⚡ 快捷指令列表**', ''];
     for (const [name, prompt] of entries) {
-      lines.push(`/q ${name}`);
-      lines.push(`  ${prompt}`);
+      lines.push(`**${name}**`);
+      lines.push(prompt);
     }
     lines.push('');
     lines.push('用 /q <名字> 执行，/q del <名字> 删除');
@@ -506,7 +508,7 @@ export function handleQuick(_ctx: CommandContext, args: string): CommandResult {
     }
     upsertQuickCommand(name, prompt);
     return {
-      reply: [`✅ 快捷指令已保存`, '', `/q ${name.toLowerCase()}`, `  ${prompt}`].join('\n'),
+      reply: [`✅ **快捷指令已保存**`, '', `**/q ${name.toLowerCase()}**`, prompt].join('\n'),
       handled: true,
     };
   }
@@ -540,22 +542,21 @@ export function handleModelConfig(_ctx: CommandContext, args: string): CommandRe
     if (entries.length === 0) {
       return {
         reply: [
-          '📋 模型别名列表（空）',
+          '**📋 模型别名列表（空）**',
           '',
-          '用法:',
-          '  /model-config <别名> <完整模型ID>  — 添加/更新别名',
-          '  /model-config del <别名>           — 删除别名',
-          '  /model-config <别名>               — 查看单个别名',
+          '- /model-config <别名> <完整模型ID> — 添加/更新',
+          '- /model-config del <别名> — 删除',
+          '- /model-config <别名> — 查看单个',
           '',
           '例: /model-config sonnet claude-sonnet-4-6-thinking[1m]',
         ].join('\n'),
         handled: true,
       };
     }
-    const lines = ['📋 模型别名列表', ''];
+    const lines = ['**📋 模型别名列表**', ''];
     for (const [alias, modelId] of entries) {
-      lines.push(`${alias}`);
-      lines.push(`  → ${modelId}`);
+      lines.push(`**${alias}**`);
+      lines.push(modelId);
     }
     lines.push('');
     lines.push('用 /model <别名> 切换，/model-config del <别名> 删除');
@@ -580,7 +581,7 @@ export function handleModelConfig(_ctx: CommandContext, args: string): CommandRe
     if (!modelId) {
       return { reply: `❌ 别名不存在: ${parts[0]}\n\n用 /model-config 查看所有别名`, handled: true };
     }
-    return { reply: `${parts[0]}\n  → ${modelId}`, handled: true };
+    return { reply: `**${parts[0]}**\n${modelId}`, handled: true };
   }
 
   // /model-config <别名> <完整模型ID>  — 添加/更新
@@ -589,10 +590,10 @@ export function handleModelConfig(_ctx: CommandContext, args: string): CommandRe
   upsertAlias(alias, modelId);
   return {
     reply: [
-      `✅ 别名已保存`,
+      `✅ **别名已保存**`,
       '',
-      `${alias}`,
-      `  → ${modelId}`,
+      `**${alias}**`,
+      modelId,
       '',
       `用 /model ${alias} 切换`,
     ].join('\n'),
@@ -607,12 +608,12 @@ export function handleSendYou(ctx: CommandContext, _args: string): CommandResult
   });
   return {
     reply: [
-      '📥 准备接收文件',
+      '**📥 准备接收文件**',
       '',
       '请直接发送图片或文件（可多次发送）。',
-      '发完后请发：/send-you-end [对这些文件的要求]',
+      '发完后发: /send-you-end [对这些文件的要求]',
       '',
-      '发送 /send-you-cancel 取消。',
+      '取消: /send-you-cancel',
     ].join('\n'),
     handled: true,
   };
