@@ -279,6 +279,16 @@ npm run daemon -- logs       # 查看日志
 
 直接发送语音消息会用本地模型（mlx_whisper）转成文字再交给 Claude。
 
+## 交流社群
+
+如果有任何问题、使用反馈，或者想和大家一起交流，欢迎扫码加我微信进群。
+
+> 添加时请备注 **wechat-claude code**，方便我识别。
+
+<p align="center">
+  <img src="assets/wechat-qr.jpg" width="220" alt="微信二维码" />
+</p>
+
 ## 致谢
 
 本项目基于 [wechat-claude-code](https://github.com/Wechat-ggGitHub/wechat-claude-code)（MIT License）进行二次开发，感谢原作者的出色工作。
