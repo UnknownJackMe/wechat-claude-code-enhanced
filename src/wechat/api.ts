@@ -19,7 +19,9 @@ export class WeChatApi {
   private readonly baseUrl: string;
   private readonly uin: string;
   private readonly nextSendTime = new Map<string, number>();
-  private static readonly MIN_SEND_INTERVAL = 2500;
+  private static readonly MIN_SEND_INTERVAL = 4000;
+  private static readonly MAX_SEND_SLOT_WAIT = 60_000;
+  private static readonly RETRY_BACKOFFS_MS = [3_000, 6_000, 12_000, 24_000, 30_000, 30_000];
 
   constructor(token: string, baseUrl: string = 'https://ilinkai.weixin.qq.com') {
     if (baseUrl) {
@@ -95,6 +97,28 @@ export class WeChatApi {
     }
   }
 
+  private async waitForSendSlot(userId?: string): Promise<void> {
+    if (!userId) return;
+
+    const now = Date.now();
+    let nextAvailable = this.nextSendTime.get(userId) ?? now;
+    if (nextAvailable - now > WeChatApi.MAX_SEND_SLOT_WAIT) {
+      logger.warn('Rate limiter slot too far in the future, resetting', {
+        userId,
+        waitMs: nextAvailable - now,
+      });
+      nextAvailable = now;
+    }
+
+    const sendAt = Math.max(now, nextAvailable);
+    this.nextSendTime.set(userId, sendAt + WeChatApi.MIN_SEND_INTERVAL);
+    const waitMs = sendAt - now;
+    if (waitMs > 0) {
+      logger.debug('Rate limiter waiting', { userId, waitMs });
+      await new Promise(r => setTimeout(r, waitMs));
+    }
+  }
+
   /** Long-poll for new messages. Timeout 35s for long-polling. */
   async getUpdates(buf?: string): Promise<GetUpdatesResp> {
     return this.request<GetUpdatesResp>(
@@ -107,33 +131,22 @@ export class WeChatApi {
   /** Send a message to a user. Per-user rate limited, retries on rate-limit (ret: -2). */
   async sendMessage(req: SendMessageReq): Promise<void> {
     const userId = req.msg?.to_user_id;
-    if (userId) {
-      const now = Date.now();
-      const nextAvailable = (this.nextSendTime.get(userId) ?? 0) + WeChatApi.MIN_SEND_INTERVAL;
-      const sendAt = Math.max(now, nextAvailable);
-      this.nextSendTime.set(userId, sendAt);
-      const waitMs = sendAt - now;
-      if (waitMs > 0) {
-        logger.debug('Rate limiter waiting', { userId, waitMs });
-        await new Promise(r => setTimeout(r, waitMs));
-      }
-    }
 
-    const MAX_RETRIES = 2;
-    let delay = 3_000;
-    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    // Retry generously but finitely: one initial send plus six capped backoffs.
+    for (let attempt = 0; attempt <= WeChatApi.RETRY_BACKOFFS_MS.length; attempt++) {
+      await this.waitForSendSlot(userId);
       const res = await this.request<{ ret?: number }>('ilink/bot/sendmessage', req);
       if (res.ret === -2) {
+        const delay = WeChatApi.RETRY_BACKOFFS_MS[attempt];
+        if (delay === undefined) {
+          logger.warn('sendMessage rate-limited after max retries', { retries: WeChatApi.RETRY_BACKOFFS_MS.length });
+          throw new Error(`sendMessage rate-limited after ${WeChatApi.RETRY_BACKOFFS_MS.length} retries`);
+        }
+        logger.warn('sendMessage rate-limited (ret:-2), retrying', { attempt, delayMs: delay });
         if (userId) {
           this.nextSendTime.set(userId, Date.now() + delay + WeChatApi.MIN_SEND_INTERVAL);
         }
-        if (attempt === MAX_RETRIES) {
-          logger.warn('sendMessage rate-limited after max retries', { attempts: MAX_RETRIES });
-          throw new Error(`sendMessage rate-limited after ${MAX_RETRIES} retries`);
-        }
-        logger.warn('sendMessage rate-limited (ret:-2), retrying', { attempt, delayMs: delay });
         await new Promise(r => setTimeout(r, delay));
-        delay = Math.min(delay * 2, 15_000);
         continue;
       }
       return;

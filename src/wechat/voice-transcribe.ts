@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import type { MessageItem } from './types.js';
@@ -10,14 +10,28 @@ const WHISPER_MODEL = 'mlx-community/whisper-large-v3-mlx';
 const SILK_TIMEOUT_MS = 30_000;
 const FFMPEG_TIMEOUT_MS = 30_000;
 const WHISPER_TIMEOUT_MS = 120_000;
+const NEGATIVE_BINARY_CACHE_MS = 60_000;
+const MAX_VOICE_DOWNLOAD_SIZE = 25 * 1024 * 1024;
+const MAX_TRANSCRIPT_BYTES = 64 * 1024;
+const MAX_TRANSCRIPT_CHARS = 4000;
+const MAX_STDERR_CHARS = 4000;
 
 // WeChat voice is SILK v3 (encode_type 4) — ffmpeg can't decode it directly.
 // We decode SILK → PCM with the `pilk` Python package, then ffmpeg wraps it to wav.
 // launchd's PATH differs from the shell, so we resolve every external binary to an
 // absolute path by probing known locations rather than relying on PATH lookup.
 
+interface BinaryProbeCache {
+  value: string | null | undefined;
+  checkedAt: number;
+}
+
+function isFreshMiss(cache: BinaryProbeCache): boolean {
+  return cache.value === null && Date.now() - cache.checkedAt < NEGATIVE_BINARY_CACHE_MS;
+}
+
 /** Probe a list of candidate paths, returning the first that runs `--probe`-style check. */
-function resolveBinary(name: string, candidates: string[], checkArgs: string[]): string | null {
+function resolveBinary(candidates: string[], checkArgs: string[]): string | null {
   for (const bin of candidates) {
     try {
       const r = spawnSync(bin, checkArgs, { stdio: 'ignore' });
@@ -30,9 +44,10 @@ function resolveBinary(name: string, candidates: string[], checkArgs: string[]):
   return null;
 }
 
-let _python: string | null | undefined;
+let pythonCache: BinaryProbeCache = { value: undefined, checkedAt: 0 };
 function findPython(): string | null {
-  if (_python !== undefined) return _python;
+  if (pythonCache.value) return pythonCache.value;
+  if (isFreshMiss(pythonCache)) return null;
   const candidates = [
     join(homedir(), 'miniforge3', 'bin', 'python3'),
     join(homedir(), 'miniconda3', 'bin', 'python3'),
@@ -46,21 +61,22 @@ function findPython(): string | null {
     try {
       const r = spawnSync(py, ['-c', 'import pilk'], { stdio: 'ignore' });
       if (r.status === 0) {
-        _python = py;
+        pythonCache = { value: py, checkedAt: Date.now() };
         logger.info('Found python with pilk', { python: py });
         return py;
       }
     } catch { /* try next */ }
   }
   logger.warn('No python with pilk found — voice transcription unavailable');
-  _python = null;
+  pythonCache = { value: null, checkedAt: Date.now() };
   return null;
 }
 
-let _mlxWhisper: string | null | undefined;
+let mlxWhisperCache: BinaryProbeCache = { value: undefined, checkedAt: 0 };
 function findMlxWhisper(): string | null {
-  if (_mlxWhisper !== undefined) return _mlxWhisper;
-  _mlxWhisper = resolveBinary('mlx_whisper', [
+  if (mlxWhisperCache.value) return mlxWhisperCache.value;
+  if (isFreshMiss(mlxWhisperCache)) return null;
+  const mlxWhisper = resolveBinary([
     join(homedir(), 'miniforge3', 'bin', 'mlx_whisper'),
     join(homedir(), 'miniconda3', 'bin', 'mlx_whisper'),
     join(homedir(), 'anaconda3', 'bin', 'mlx_whisper'),
@@ -68,55 +84,80 @@ function findMlxWhisper(): string | null {
     '/usr/local/bin/mlx_whisper',
     'mlx_whisper',
   ], ['--help']);
-  if (_mlxWhisper) logger.info('Found mlx_whisper', { path: _mlxWhisper });
+  mlxWhisperCache = { value: mlxWhisper, checkedAt: Date.now() };
+  if (mlxWhisper) logger.info('Found mlx_whisper', { path: mlxWhisper });
   else logger.warn('mlx_whisper not found — voice transcription unavailable');
-  return _mlxWhisper;
+  return mlxWhisper;
 }
 
-let _ffmpeg: string | null | undefined;
+let ffmpegCache: BinaryProbeCache = { value: undefined, checkedAt: 0 };
 function findFfmpeg(): string | null {
-  if (_ffmpeg !== undefined) return _ffmpeg;
-  _ffmpeg = resolveBinary('ffmpeg', [
+  if (ffmpegCache.value) return ffmpegCache.value;
+  if (isFreshMiss(ffmpegCache)) return null;
+  const ffmpeg = resolveBinary([
     '/opt/homebrew/bin/ffmpeg',
     '/usr/local/bin/ffmpeg',
     '/usr/bin/ffmpeg',
     join(homedir(), 'miniforge3', 'bin', 'ffmpeg'),
     'ffmpeg',
   ], ['-version']);
-  if (_ffmpeg) logger.info('Found ffmpeg', { path: _ffmpeg });
+  ffmpegCache = { value: ffmpeg, checkedAt: Date.now() };
+  if (ffmpeg) logger.info('Found ffmpeg', { path: ffmpeg });
   else logger.warn('ffmpeg not found — voice transcription unavailable');
-  return _ffmpeg;
+  return ffmpeg;
 }
 
 /** Run a command with a timeout; resolves on exit 0, rejects on spawn error/timeout/non-zero. */
 function runCommand(cmd: string, args: string[], timeoutMs: number): Promise<void> {
   return new Promise((resolve, reject) => {
-    const child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(cmd, args, { stdio: ['ignore', 'ignore', 'pipe'] });
     let settled = false;
-    const stderrParts: string[] = [];
+    let timedOut = false;
+    let stderrText = '';
+
+    const finish = (fn: () => void): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn();
+    };
 
     const timer = setTimeout(() => {
       if (settled) return;
-      settled = true;
-      child.kill('SIGKILL');
-      reject(new Error(`${cmd} timed out after ${timeoutMs}ms`));
+      timedOut = true;
+      const killed = child.kill('SIGKILL');
+      if (!killed && child.exitCode !== null) {
+        finish(() => reject(new Error(`${cmd} timed out after ${timeoutMs}ms`)));
+      }
     }, timeoutMs);
 
-    child.stderr?.on('data', (c) => stderrParts.push(String(c)));
-    child.on('error', (err) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      reject(err);
+    child.stderr?.on('data', (c) => {
+      if (stderrText.length < MAX_STDERR_CHARS) {
+        stderrText += String(c).slice(0, MAX_STDERR_CHARS - stderrText.length);
+      }
     });
-    child.on('close', (code) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      if (code === 0) resolve();
-      else reject(new Error(`${cmd} exited with code ${code}: ${stderrParts.join('').slice(0, 300)}`));
+    child.on('error', (err) => {
+      finish(() => reject(timedOut ? new Error(`${cmd} timed out after ${timeoutMs}ms`) : err));
+    });
+    child.on('close', (code, signal) => {
+      finish(() => {
+        if (timedOut) {
+          reject(new Error(`${cmd} timed out after ${timeoutMs}ms`));
+          return;
+        }
+        if (code === 0) resolve();
+        else reject(new Error(`${cmd} exited with code ${code ?? 'null'}${signal ? ` signal ${signal}` : ''}: ${stderrText.slice(0, 300)}`));
+      });
     });
   });
+}
+
+function limitTranscript(text: string): string | null {
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+  if (trimmed.length <= MAX_TRANSCRIPT_CHARS) return trimmed;
+  logger.warn('Voice transcript truncated', { length: trimmed.length, max: MAX_TRANSCRIPT_CHARS });
+  return `${trimmed.slice(0, MAX_TRANSCRIPT_CHARS)}\n\n[语音转写过长，已截断]`;
 }
 
 /** Extract CDN download params from a voice item. */
@@ -154,6 +195,9 @@ export async function transcribeVoice(item: MessageItem): Promise<string | null>
   try {
     // 1. Download + decrypt → SILK file
     const decrypted = await downloadAndDecrypt(cdnData.encryptQueryParam, cdnData.aesKey);
+    if (decrypted.length > MAX_VOICE_DOWNLOAD_SIZE) {
+      throw new Error(`Voice download too large: ${Math.round(decrypted.length / 1024 / 1024)}MB exceeds ${Math.round(MAX_VOICE_DOWNLOAD_SIZE / 1024 / 1024)}MB limit`);
+    }
     writeFileSync(silkPath, decrypted);
 
     // 2. SILK → PCM (16kHz) via pilk (handles Tencent's 0x02 prefix automatically)
@@ -184,9 +228,13 @@ export async function transcribeVoice(item: MessageItem): Promise<string | null>
       logger.warn('Whisper produced no output file');
       return null;
     }
-    const text = readFileSync(txtPath, 'utf-8').trim();
-    logger.info('Voice transcribed', { length: text.length });
-    return text || null;
+    const txtSize = statSync(txtPath).size;
+    if (txtSize > MAX_TRANSCRIPT_BYTES) {
+      throw new Error(`Whisper output too large: ${txtSize} bytes exceeds ${MAX_TRANSCRIPT_BYTES} byte limit`);
+    }
+    const text = limitTranscript(readFileSync(txtPath, 'utf-8'));
+    logger.info('Voice transcribed', { length: text?.length ?? 0 });
+    return text;
   } catch (err) {
     logger.warn('Voice transcription failed', { error: err instanceof Error ? err.message : String(err) });
     return null;

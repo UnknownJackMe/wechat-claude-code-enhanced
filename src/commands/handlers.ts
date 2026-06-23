@@ -118,6 +118,64 @@ const SENDABLE_EXTENSIONS = new Set([
   '.zip', '.tar', '.gz', '.json', '.ts', '.js', '.py',
 ]);
 const LOOP_INTERVAL_TOKEN_RE = /^(-?\d+(?:\.\d+)?)\s*(s|m|h|d)$/i;
+const COMMAND_NAMES = new Set([
+  'help', 'clear', 'reset', 'cwd', 'model', 'mode', 'model-config', 'q', 'prompt',
+  'status', 'skills', 'history', 'undo', 'compact', 'resume', 'effort', 'advisor',
+  'goal', 'loop', 'configs', 'set-config', 'switch-config', 'delete-config',
+  'send', 'send-me', 'send-you', 'send-you-cancel', 'send-you-end', 'version', 'v',
+]);
+const QUICK_SUBCOMMANDS = new Set(['set', 'del']);
+const NAME_RE = /^[a-z0-9][a-z0-9_-]{0,31}$/;
+const MODEL_ID_RE = /^[a-zA-Z0-9][a-zA-Z0-9._:/@+=\-[\]]{0,127}$/;
+const MAX_QUICK_PROMPT_LENGTH = 8_000;
+
+function normalizeName(input: string): string {
+  return input.trim().toLowerCase();
+}
+
+function validateStoredName(kind: '快捷指令名' | '模型别名', raw: string, existingOtherNames: Set<string>): string | null {
+  const name = normalizeName(raw);
+  if (!name) return `${kind}不能为空。`;
+  if (!NAME_RE.test(name)) {
+    return `${kind}只能使用 1-32 位小写字母、数字、短横线或下划线，且必须以字母或数字开头。`;
+  }
+  if (COMMAND_NAMES.has(name) || QUICK_SUBCOMMANDS.has(name)) {
+    return `${kind}不能与内置命令或子命令冲突: ${name}`;
+  }
+  if (existingOtherNames.has(name)) {
+    return `${kind}与已有${kind === '快捷指令名' ? '模型别名' : '快捷指令名'}冲突: ${name}`;
+  }
+  return null;
+}
+
+function hasControlChars(input: string): boolean {
+  return /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(input);
+}
+
+function validateQuickPrompt(prompt: string): string | null {
+  if (!prompt.trim()) return '快捷指令内容不能为空。';
+  if (prompt.length > MAX_QUICK_PROMPT_LENGTH) return `快捷指令内容过长，最多 ${MAX_QUICK_PROMPT_LENGTH} 字符。`;
+  if (hasControlChars(prompt)) return '快捷指令内容不能包含控制字符。';
+  return null;
+}
+
+function validateModelId(modelId: string): string | null {
+  if (!modelId) return '完整模型 ID 不能为空。';
+  if (!MODEL_ID_RE.test(modelId)) {
+    return '完整模型 ID 只能使用字母、数字和 . _ : / @ + = - [ ]，长度最多 128。';
+  }
+  return null;
+}
+
+function escapeInlineCode(input: string): string {
+  return input.replace(/`/g, '\\`').replace(/\r?\n/g, ' ');
+}
+
+function markdownCodeBlock(input: string): string {
+  const maxRun = Math.max(2, ...Array.from(input.matchAll(/`+/g), match => match[0].length));
+  const fence = '`'.repeat(maxRun + 1);
+  return `${fence}\n${input.replace(/\r\n?/g, '\n')}\n${fence}`;
+}
 
 function getSkills(): SkillInfo[] {
   const now = Date.now();
@@ -488,8 +546,8 @@ export function handleQuick(_ctx: CommandContext, args: string): CommandResult {
     }
     const lines = ['**⚡ 快捷指令列表**', ''];
     for (const [name, prompt] of entries) {
-      lines.push(`**${name}**`);
-      lines.push(prompt);
+      lines.push(`**/q ${escapeInlineCode(name)}**`);
+      lines.push(markdownCodeBlock(prompt));
     }
     lines.push('');
     lines.push('用 /q <名字> 执行，/q del <名字> 删除');
@@ -501,14 +559,19 @@ export function handleQuick(_ctx: CommandContext, args: string): CommandResult {
 
   // /q set <名字> <内容>
   if (sub === 'set') {
-    const name = parts[1];
-    const prompt = parts.slice(2).join(' ');
-    if (!name || !prompt) {
+    const match = trimmed.match(/^set\s+(\S+)\s+([\s\S]+)$/i);
+    if (!match) {
       return { reply: '用法: /q set <名字> <内容>\n例: /q set test 运行所有测试并报告结果', handled: true };
     }
+    const name = normalizeName(match[1]);
+    const prompt = match[2].trim();
+    const nameError = validateStoredName('快捷指令名', name, new Set(Object.keys(loadModelAliases())));
+    if (nameError) return { reply: `❌ ${nameError}`, handled: true };
+    const promptError = validateQuickPrompt(prompt);
+    if (promptError) return { reply: `❌ ${promptError}`, handled: true };
     upsertQuickCommand(name, prompt);
     return {
-      reply: [`✅ **快捷指令已保存**`, '', `**/q ${name.toLowerCase()}**`, prompt].join('\n'),
+      reply: [`✅ **快捷指令已保存**`, '', `**/q ${escapeInlineCode(name)}**`, markdownCodeBlock(prompt)].join('\n'),
       handled: true,
     };
   }
@@ -517,17 +580,26 @@ export function handleQuick(_ctx: CommandContext, args: string): CommandResult {
   if (sub === 'del') {
     const name = parts[1];
     if (!name) return { reply: '用法: /q del <名字>', handled: true };
-    const deleted = deleteQuickCommand(name);
-    return { reply: deleted ? `✅ 已删除快捷指令: ${name}` : `❌ 快捷指令不存在: ${name}`, handled: true };
+    const normalized = normalizeName(name);
+    const nameError = validateStoredName('快捷指令名', normalized, new Set());
+    if (nameError) return { reply: `❌ ${nameError}`, handled: true };
+    const deleted = deleteQuickCommand(normalized);
+    return { reply: deleted ? `✅ 已删除快捷指令: ${escapeInlineCode(normalized)}` : `❌ 快捷指令不存在: ${escapeInlineCode(normalized)}`, handled: true };
   }
 
   // /q <名字>  — 执行：把存的内容作为 prompt 发给 Claude
-  const prompt = resolveQuickCommand(parts[0]);
+  const name = normalizeName(parts[0]);
+  const nameError = validateStoredName('快捷指令名', name, new Set());
+  if (nameError) return { reply: `❌ ${nameError}`, handled: true };
+  const prompt = resolveQuickCommand(name);
   if (!prompt) {
-    return { reply: `❌ 快捷指令不存在: ${parts[0]}\n\n用 /q 查看所有快捷指令`, handled: true };
+    return { reply: `❌ 快捷指令不存在: ${escapeInlineCode(name)}\n\n用 /q 查看所有快捷指令`, handled: true };
   }
   // 允许附加参数：/q test --verbose → "运行所有测试 --verbose"
-  const extra = parts.slice(1).join(' ');
+  const extra = trimmed.slice(parts[0].length).trim();
+  if (extra.length > MAX_QUICK_PROMPT_LENGTH || hasControlChars(extra)) {
+    return { reply: '❌ 附加参数过长或包含控制字符。', handled: true };
+  }
   const finalPrompt = extra ? `${prompt} ${extra}` : prompt;
   return { handled: true, claudePrompt: finalPrompt };
 }
@@ -555,8 +627,8 @@ export function handleModelConfig(_ctx: CommandContext, args: string): CommandRe
     }
     const lines = ['**📋 模型别名列表**', ''];
     for (const [alias, modelId] of entries) {
-      lines.push(`**${alias}**`);
-      lines.push(modelId);
+      lines.push(`**${escapeInlineCode(alias)}**`);
+      lines.push(`\`${escapeInlineCode(modelId)}\``);
     }
     lines.push('');
     lines.push('用 /model <别名> 切换，/model-config del <别名> 删除');
@@ -567,35 +639,48 @@ export function handleModelConfig(_ctx: CommandContext, args: string): CommandRe
   if (parts[0].toLowerCase() === 'del') {
     const alias = parts[1];
     if (!alias) return { reply: '用法: /model-config del <别名>', handled: true };
-    const deleted = deleteAlias(alias);
+    const normalized = normalizeName(alias);
+    const aliasError = validateStoredName('模型别名', normalized, new Set());
+    if (aliasError) return { reply: `❌ ${aliasError}`, handled: true };
+    const deleted = deleteAlias(normalized);
     return {
-      reply: deleted ? `✅ 已删除别名: ${alias}` : `❌ 别名不存在: ${alias}`,
+      reply: deleted ? `✅ 已删除别名: ${escapeInlineCode(normalized)}` : `❌ 别名不存在: ${escapeInlineCode(normalized)}`,
       handled: true,
     };
   }
 
   // /model-config <别名>  — 查看单个
   if (parts.length === 1) {
+    const alias = normalizeName(parts[0]);
+    const aliasError = validateStoredName('模型别名', alias, new Set());
+    if (aliasError) return { reply: `❌ ${aliasError}`, handled: true };
     const aliases = loadModelAliases();
-    const modelId = aliases[parts[0].toLowerCase()];
+    const modelId = aliases[alias];
     if (!modelId) {
-      return { reply: `❌ 别名不存在: ${parts[0]}\n\n用 /model-config 查看所有别名`, handled: true };
+      return { reply: `❌ 别名不存在: ${escapeInlineCode(alias)}\n\n用 /model-config 查看所有别名`, handled: true };
     }
-    return { reply: `**${parts[0]}**\n${modelId}`, handled: true };
+    return { reply: `**${escapeInlineCode(alias)}**\n\`${escapeInlineCode(modelId)}\``, handled: true };
   }
 
   // /model-config <别名> <完整模型ID>  — 添加/更新
-  const alias = parts[0];
-  const modelId = parts.slice(1).join(' ');
+  const alias = normalizeName(parts[0]);
+  const modelId = parts[1];
+  if (parts.length > 2) {
+    return { reply: '❌ 模型 ID 不能包含空格。\n用法: /model-config <别名> <完整模型ID>', handled: true };
+  }
+  const aliasError = validateStoredName('模型别名', alias, new Set(Object.keys(loadQuickCommands())));
+  if (aliasError) return { reply: `❌ ${aliasError}`, handled: true };
+  const modelIdError = validateModelId(modelId);
+  if (modelIdError) return { reply: `❌ ${modelIdError}`, handled: true };
   upsertAlias(alias, modelId);
   return {
     reply: [
       `✅ **别名已保存**`,
       '',
-      `**${alias}**`,
-      modelId,
+      `**${escapeInlineCode(alias)}**`,
+      `\`${escapeInlineCode(modelId)}\``,
       '',
-      `用 /model ${alias} 切换`,
+      `用 /model ${escapeInlineCode(alias)} 切换`,
     ].join('\n'),
     handled: true,
   };

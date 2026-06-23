@@ -1,8 +1,11 @@
-import { readFileSync, writeFileSync, chmodSync, mkdirSync, renameSync, unlinkSync } from "node:fs";
+import { readFileSync, writeFileSync, chmodSync, mkdirSync, renameSync, unlinkSync, rmSync, statSync } from "node:fs";
 import { dirname } from "node:path";
 import { logger } from "./logger.js";
 
 const READ_RETRY_DELAYS_MS = [5, 15];
+const LOCK_RETRY_DELAY_MS = 25;
+const LOCK_TIMEOUT_MS = 2_000;
+const STALE_LOCK_MS = 30_000;
 
 function sleepSync(ms: number): void {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
@@ -11,6 +14,40 @@ function sleepSync(ms: number): void {
 export function validateAccountId(accountId: string): void {
   if (!/^[a-zA-Z0-9_.@=-]+$/.test(accountId)) {
     throw new Error(`Invalid accountId: "${accountId}"`);
+  }
+}
+
+function acquireLock(lockPath: string): () => void {
+  const start = Date.now();
+  while (true) {
+    try {
+      mkdirSync(lockPath, { mode: 0o700 });
+      return () => {
+        try {
+          rmSync(lockPath, { recursive: true, force: true });
+        } catch {
+          // Ignore lock cleanup failures; later calls can remove stale locks.
+        }
+      };
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code !== 'EEXIST') throw err;
+
+      try {
+        const st = statSync(lockPath);
+        if (Date.now() - st.mtimeMs > STALE_LOCK_MS) {
+          rmSync(lockPath, { recursive: true, force: true });
+          continue;
+        }
+      } catch {
+        continue;
+      }
+
+      if (Date.now() - start > LOCK_TIMEOUT_MS) {
+        throw new Error(`Timed out waiting for JSON lock: ${lockPath}`);
+      }
+      sleepSync(LOCK_RETRY_DELAY_MS);
+    }
   }
 }
 
@@ -72,5 +109,18 @@ export function saveJson(filePath: string, data: unknown): void {
       // Ignore cleanup failures for temp files that were never created or already renamed.
     }
     throw err;
+  }
+}
+
+/** Atomically load, transform, and save JSON while holding a per-file lock. */
+export function updateJson<T>(filePath: string, fallback: T, updater: (current: T) => T): T {
+  mkdirSync(dirname(filePath), { recursive: true });
+  const release = acquireLock(`${filePath}.lock`);
+  try {
+    const updated = updater(loadJson<T>(filePath, fallback));
+    saveJson(filePath, updated);
+    return updated;
+  } finally {
+    release();
   }
 }

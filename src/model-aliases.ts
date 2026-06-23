@@ -1,13 +1,20 @@
 import { join } from 'node:path';
 import { homedir } from 'node:os';
-import { loadJson, saveJson } from './store.js';
+import { loadJson, saveJson, updateJson } from './store.js';
 
 const ALIASES_PATH = join(homedir(), '.wechat-claude-code', 'model-aliases.json');
 
 export type ModelAliases = Record<string, string>;
 
+function normalizeAliases(input: unknown): ModelAliases {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return {};
+  const entries = Object.entries(input as Record<string, unknown>)
+    .filter((entry): entry is [string, string] => typeof entry[1] === 'string');
+  return Object.fromEntries(entries);
+}
+
 export function loadModelAliases(): ModelAliases {
-  return loadJson<ModelAliases>(ALIASES_PATH, {});
+  return normalizeAliases(loadJson<unknown>(ALIASES_PATH, {}));
 }
 
 export function saveModelAliases(aliases: ModelAliases): void {
@@ -21,16 +28,22 @@ export function resolveModel(nameOrAlias: string): string {
 }
 
 export function upsertAlias(alias: string, modelId: string): void {
-  const aliases = loadModelAliases();
-  aliases[alias.toLowerCase()] = modelId;
-  saveModelAliases(aliases);
+  updateJson<ModelAliases>(ALIASES_PATH, {}, (current) => {
+    const aliases = normalizeAliases(current);
+    aliases[alias.toLowerCase()] = modelId;
+    return aliases;
+  });
 }
 
 export function deleteAlias(alias: string): boolean {
-  const aliases = loadModelAliases();
   const key = alias.toLowerCase();
-  if (!(key in aliases)) return false;
-  delete aliases[key];
-  saveModelAliases(aliases);
-  return true;
+  let deleted = false;
+  updateJson<ModelAliases>(ALIASES_PATH, {}, (current) => {
+    const aliases = normalizeAliases(current);
+    if (!(key in aliases)) return aliases;
+    delete aliases[key];
+    deleted = true;
+    return aliases;
+  });
+  return deleted;
 }

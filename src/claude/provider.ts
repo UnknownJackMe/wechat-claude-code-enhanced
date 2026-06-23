@@ -65,15 +65,29 @@ const MODEL_PROBE_TIMEOUT_MS = 20_000;
 export async function validateModel(model: string, cwd: string): Promise<ModelValidationResult> {
   return new Promise<ModelValidationResult>((resolve) => {
     let settled = false;
+    let child: ChildProcess | undefined;
+    let timer: NodeJS.Timeout | undefined;
+    let killFallbackTimer: NodeJS.Timeout | undefined;
+    let pendingTimeoutResult: ModelValidationResult | undefined;
+
+    const cleanup = () => {
+      if (timer) {
+        clearTimeout(timer);
+        timer = undefined;
+      }
+      if (killFallbackTimer) {
+        clearTimeout(killFallbackTimer);
+        killFallbackTimer = undefined;
+      }
+    };
+
     const finish = (r: ModelValidationResult) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
-      try { child.kill('SIGKILL'); } catch { /* ignore */ }
+      cleanup();
       resolve(r);
     };
 
-    let child: ChildProcess;
     try {
       child = spawn('claude', [
         '-p', 'reply with just: ok',
@@ -87,16 +101,28 @@ export async function validateModel(model: string, cwd: string): Promise<ModelVa
     }
 
     // Invalid model hangs with no output — timeout is how we catch it.
-    const timer = setTimeout(() => {
-      finish({ ok: false, reason: 'timeout', detail: '探测超时（无响应），通常是模型名无效或服务无法访问' });
+    timer = setTimeout(() => {
+      pendingTimeoutResult = {
+        ok: false,
+        reason: 'timeout',
+        detail: '探测超时（无响应），通常是模型名无效或服务无法访问',
+      };
+      try {
+        child?.kill('SIGKILL');
+      } catch {
+        // Fall through to the fallback resolver below.
+      }
+      killFallbackTimer = setTimeout(() => {
+        finish(pendingTimeoutResult!);
+      }, FORCE_KILL_AFTER_MS);
     }, MODEL_PROBE_TIMEOUT_MS);
 
     const out: string[] = [];
     const errOut: string[] = [];
-    child.stdout!.setEncoding('utf8');
-    child.stdout!.on('data', (c: string) => out.push(c));
-    child.stderr!.setEncoding('utf8');
-    child.stderr!.on('data', (c: string) => errOut.push(c));
+    child.stdout?.setEncoding('utf8');
+    child.stdout?.on('data', (c: string) => out.push(c));
+    child.stderr?.setEncoding('utf8');
+    child.stderr?.on('data', (c: string) => errOut.push(c));
 
     child.on('error', (err) => {
       finish({ ok: false, reason: 'unknown', detail: err.message });
@@ -104,6 +130,11 @@ export async function validateModel(model: string, cwd: string): Promise<ModelVa
 
     child.on('close', () => {
       if (settled) return;
+      if (pendingTimeoutResult) {
+        finish(pendingTimeoutResult);
+        return;
+      }
+
       const stdout = out.join('').trim();
       const stderr = errOut.join('').trim();
       let parsed: any;
@@ -324,6 +355,7 @@ export async function claudeQuery(options: QueryOptions): Promise<QueryResult> {
     };
 
     const cleanup = () => {
+      safeEndStdin();
       if (abortListenerRegistered) {
         abortController?.signal.removeEventListener('abort', onAbort);
         abortListenerRegistered = false;
@@ -351,6 +383,7 @@ export async function claudeQuery(options: QueryOptions): Promise<QueryResult> {
     const requestChildTermination = (reason: 'timeout' | 'abort' | 'error') => {
       // Fix for issue 1: always terminate the child on every failure path, and
       // escalate from SIGTERM to SIGKILL if it does not exit promptly.
+      safeEndStdin();
       if (!child || child.exitCode !== null || child.signalCode !== null) return;
       try {
         child.kill('SIGTERM');
@@ -391,7 +424,7 @@ export async function claudeQuery(options: QueryOptions): Promise<QueryResult> {
     /** Write a line to stdin without closing it (used for control_response in approve mode). */
     const writeStdin = (input: string) => {
       const stdin = child?.stdin;
-      if (!stdin || stdin.destroyed) return;
+      if (!stdin || settled || stdin.destroyed || stdin.writableEnded) return;
       hookStdinError();
       try {
         stdin.write(input);
@@ -400,9 +433,21 @@ export async function claudeQuery(options: QueryOptions): Promise<QueryResult> {
       }
     };
 
+    const safeEndStdin = () => {
+      const stdin = child?.stdin;
+      if (!stdin || stdin.destroyed || stdin.writableEnded) return;
+      hookStdinError();
+      try {
+        stdin.end();
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        logger.warn('Claude CLI stdin end failed', { message });
+      }
+    };
+
     const safeSendInput = (input: string) => {
       const stdin = child?.stdin;
-      if (!stdin) return;
+      if (!stdin || stdin.destroyed || stdin.writableEnded) return;
 
       // Fix for issue 2: stdin writes can throw or emit EPIPE if the child exits
       // before consuming input, so guard both synchronous and async paths.
@@ -419,12 +464,7 @@ export async function claudeQuery(options: QueryOptions): Promise<QueryResult> {
       // in bypass mode where the single user message is all we send.
       if (approveMode) return;
 
-      try {
-        stdin.end();
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        logger.warn('Claude CLI stdin end failed', { message });
-      }
+      safeEndStdin();
     };
 
     try {
@@ -606,7 +646,7 @@ export async function claudeQuery(options: QueryOptions): Promise<QueryResult> {
           // In approve mode stdin is kept open for control_response; the turn is now
           // done, so close stdin to let the CLI exit instead of waiting for more input.
           if (approveMode) {
-            try { child?.stdin?.end(); } catch { /* ignore */ }
+            safeEndStdin();
           }
           break;
         }

@@ -65,6 +65,12 @@ function resolveApproval(accountId: string, behavior: 'allow' | 'deny', message?
   return true;
 }
 
+/** Replace any existing pending approval so no resolver/timer is orphaned. */
+function replacePendingApproval(accountId: string, pending: PendingApproval): void {
+  resolveApproval(accountId, 'deny', '新的审批请求已到达，旧请求已自动拒绝');
+  pendingApprovals.set(accountId, pending);
+}
+
 /** Build a concise, readable WeChat message describing a tool-permission request. */
 function formatApprovalRequest(req: PermissionRequest): string {
   const lines = ['**🔐 需要确认操作**', '', `**工具** ${req.toolName}`];
@@ -406,7 +412,11 @@ async function runDaemon(): Promise<void> {
     try {
       while (messageQueue.length > 0) {
         const msg = messageQueue.shift()!;
-        await handleMessage(msg, account!, session, sessionStore, sender, config, sharedCtx, activeControllers, messageQueue);
+        try {
+          await handleMessage(msg, account!, session, sessionStore, sender, config, sharedCtx, activeControllers, messageQueue);
+        } catch (err) {
+          logger.error('Failed to process queued message', { error: err instanceof Error ? err.message : String(err) });
+        }
       }
     } finally {
       processingQueue = false;
@@ -736,36 +746,44 @@ async function handleMessage(
     if (result.handled && result.validateModel) {
       const target = result.validateModel;
       const cwd = (session.workingDirectory || config.workingDirectory).replace(/^~/, homedir());
+      session.state = 'processing';
+      saveSessionSafely(sessionStore, account.accountId, session, 'mark validateModel processing');
+      const validateController = new AbortController();
+      activeControllers.set(account.accountId, validateController);
       const stopTyping = sender.startTyping(fromUserId, contextToken);
-      await sender.sendText(fromUserId, contextToken, `⏳ 正在验证模型 ${target} ...`);
-      let v;
       try {
-        v = await validateModel(target, cwd);
+        await sender.sendText(fromUserId, contextToken, `⏳ 正在验证模型 ${target} ...`);
+        const v = await validateModel(target, cwd);
+        if (validateController.signal.aborted) return;
+        if (v.ok) {
+          session.model = target;
+          sessionStore.save(account.accountId, session);
+          await sender.sendText(fromUserId, contextToken, `✅ 模型已切换为:\n  ${target}`);
+        } else {
+          const reasonText: Record<string, string> = {
+            invalid_model: '模型名称无效（该模型不存在或拼写有误）',
+            auth: '认证问题（API 密钥无效、欠费或无权访问该模型）',
+            network: '网络问题（无法连接到模型服务）',
+            rate_limit: '服务限流或过载，请稍后重试',
+            timeout: '探测超时无响应（多为模型名无效或服务不可达）',
+            unknown: '未知错误',
+          };
+          const label = reasonText[v.reason ?? 'unknown'] ?? '未知错误';
+          const lines = [
+            `❌ 模型 ${target} 不可用`,
+            '',
+            `原因: ${label}`,
+          ];
+          if (v.detail) lines.push('', `详情: ${v.detail}`);
+          lines.push('', `当前仍使用:\n  ${session.model ?? '默认'}`);
+          await sender.sendText(fromUserId, contextToken, lines.join('\n'));
+        }
       } finally {
         stopTyping();
-      }
-      if (v.ok) {
-        session.model = target;
-        sessionStore.save(account.accountId, session);
-        await sender.sendText(fromUserId, contextToken, `✅ 模型已切换为:\n  ${target}`);
-      } else {
-        const reasonText: Record<string, string> = {
-          invalid_model: '模型名称无效（该模型不存在或拼写有误）',
-          auth: '认证问题（API 密钥无效、欠费或无权访问该模型）',
-          network: '网络问题（无法连接到模型服务）',
-          rate_limit: '服务限流或过载，请稍后重试',
-          timeout: '探测超时无响应（多为模型名无效或服务不可达）',
-          unknown: '未知错误',
-        };
-        const label = reasonText[v.reason ?? 'unknown'] ?? '未知错误';
-        const lines = [
-          `❌ 模型 ${target} 不可用`,
-          '',
-          `原因: ${label}`,
-        ];
-        if (v.detail) lines.push('', `详情: ${v.detail}`);
-        lines.push('', `当前仍使用:\n  ${session.model ?? '默认'}`);
-        await sender.sendText(fromUserId, contextToken, lines.join('\n'));
+        resetSessionStateSafely(sessionStore, account.accountId, session, 'validateModel finally');
+        if (activeControllers.get(account.accountId) === validateController) {
+          activeControllers.delete(account.accountId);
+        }
       }
       return;
     }
@@ -1020,11 +1038,11 @@ async function sendToClaude(
     let lastSentTime = Date.now();
 
     // Flush thresholds — keep these high to avoid hammering the WeChat rate limit.
-    // The API returns ret:-2 if we send too many messages in a short window, and
-    // retries are also rate-limited, so messages get silently dropped.
-    const MIN_BATCH_FLUSH_LEN = 200;   // don't flush tiny thinking-aloud fragments
+    // The API returns ret:-2 if we send too many messages in a short window. Larger
+    // batches + a longer interval mean fewer, bigger messages instead of many tiny ones.
+    const MIN_BATCH_FLUSH_LEN = 400;   // accumulate more before flushing mid-stream
     const SOFT_FLUSH_LIMIT = 3800;
-    const MIN_FLUSH_INTERVAL_MS = 2000; // at most one message every 2s during streaming
+    const MIN_FLUSH_INTERVAL_MS = 8000; // at most one streamed message every 8s
 
     /** Check if buffer ends at a structural boundary (double newline or horizontal rule). */
     function endsWithStructuralBoundary(text: string): boolean {
@@ -1033,6 +1051,7 @@ async function sendToClaude(
 
     // Serial promise chain — each flushText() appends to the chain, no flags needed
     let flushChain: Promise<void> = Promise.resolve();
+    let streamFlushFailed = false;
 
     function flushText(): Promise<void> {
       // Capture and clear synchronously to prevent race condition:
@@ -1050,6 +1069,7 @@ async function sendToClaude(
         anySent = true;
         lastSentTime = Date.now();
       }).catch((err) => {
+        streamFlushFailed = true;
         logger.error('flushText send failed', { error: err instanceof Error ? err.message : String(err) });
       });
       return flushChain;
@@ -1105,7 +1125,7 @@ async function sendToClaude(
               sender.sendText(fromUserId, contextToken, '⏱ 30 秒未确认，已自动拒绝此操作。').catch(() => {});
               resolveDecision({ behavior: 'deny', message: '审批超时' });
             }, APPROVAL_TIMEOUT_MS);
-            pendingApprovals.set(account.accountId, {
+            replacePendingApproval(account.accountId, {
               accountId: account.accountId,
               resolve: resolveDecision,
               toolName: req.toolName,
@@ -1160,8 +1180,9 @@ async function sendToClaude(
         logger.warn('Claude query had error but returned text, using text', { error: result.error });
       }
       sessionStore.addChatMessage(session, 'assistant', result.text);
-      // If nothing was streamed at all (e.g. streaming not supported), send full text now
-      if (!anySent) {
+      // If streaming was unavailable or a streamed chunk failed after send retries,
+      // send the full result once at the end so failed mid-stream batches are not lost.
+      if (!anySent || streamFlushFailed) {
         const chunks = splitMessage(result.text);
         for (const chunk of chunks) {
           await sender.sendText(fromUserId, contextToken, chunk);
