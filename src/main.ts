@@ -1019,8 +1019,12 @@ async function sendToClaude(
     let anySent = false;
     let lastSentTime = Date.now();
 
-    const MIN_BATCH_FLUSH_LEN = 30;
+    // Flush thresholds — keep these high to avoid hammering the WeChat rate limit.
+    // The API returns ret:-2 if we send too many messages in a short window, and
+    // retries are also rate-limited, so messages get silently dropped.
+    const MIN_BATCH_FLUSH_LEN = 200;   // don't flush tiny thinking-aloud fragments
     const SOFT_FLUSH_LIMIT = 3800;
+    const MIN_FLUSH_INTERVAL_MS = 2000; // at most one message every 2s during streaming
 
     /** Check if buffer ends at a structural boundary (double newline or horizontal rule). */
     function endsWithStructuralBoundary(text: string): boolean {
@@ -1114,17 +1118,21 @@ async function sendToClaude(
       onText: async (delta: string) => {
         textBuffer += delta;
 
-        // Flush at structural boundaries (only if buffer is substantial) or when approaching size limit
-        const shouldFlush =
-          (endsWithStructuralBoundary(textBuffer) && textBuffer.trim().length >= MIN_BATCH_FLUSH_LEN)
-          || textBuffer.length > SOFT_FLUSH_LIMIT;
+        const bufferBig = textBuffer.length > SOFT_FLUSH_LIMIT;
+        const bufferReadable = endsWithStructuralBoundary(textBuffer) && textBuffer.trim().length >= MIN_BATCH_FLUSH_LEN;
+        const intervalOk = Date.now() - lastSentTime >= MIN_FLUSH_INTERVAL_MS;
 
-        if (shouldFlush) {
+        // Flush only when content is substantial AND enough time has passed,
+        // OR when buffer is about to exceed the message size limit.
+        if (bufferBig || (bufferReadable && intervalOk)) {
           await flushText();
         }
       },
       onBlockEnd: () => {
-        if (textBuffer.trim().length >= MIN_BATCH_FLUSH_LEN || textBuffer.length > SOFT_FLUSH_LIMIT) {
+        const bufferBig = textBuffer.length > SOFT_FLUSH_LIMIT;
+        const bufferReadable = textBuffer.trim().length >= MIN_BATCH_FLUSH_LEN;
+        const intervalOk = Date.now() - lastSentTime >= MIN_FLUSH_INTERVAL_MS;
+        if (bufferBig || (bufferReadable && intervalOk)) {
           flushText();
         }
       },
