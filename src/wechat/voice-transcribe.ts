@@ -6,40 +6,51 @@ import type { MessageItem } from './types.js';
 import { downloadAndDecrypt } from './cdn.js';
 import { logger } from '../logger.js';
 
-const WHISPER_MODEL = 'mlx-community/whisper-large-v3-mlx';
+const MLX_WHISPER_MODEL = 'mlx-community/whisper-large-v3-mlx';
+const FASTER_WHISPER_MODEL = process.env.WCC_FASTER_WHISPER_MODEL || 'large-v3';
 const SILK_TIMEOUT_MS = 30_000;
 const FFMPEG_TIMEOUT_MS = 30_000;
-const WHISPER_TIMEOUT_MS = 120_000;
+const WHISPER_TIMEOUT_MS = 180_000;
 const NEGATIVE_BINARY_CACHE_MS = 60_000;
 const MAX_VOICE_DOWNLOAD_SIZE = 25 * 1024 * 1024;
 const MAX_TRANSCRIPT_BYTES = 64 * 1024;
 const MAX_TRANSCRIPT_CHARS = 4000;
 const MAX_STDERR_CHARS = 4000;
 
-// WeChat voice is SILK v3 (encode_type 4) — ffmpeg can't decode it directly.
-// We decode SILK → PCM with the `pilk` Python package, then ffmpeg wraps it to wav.
-// launchd's PATH differs from the shell, so we resolve every external binary to an
-// absolute path by probing known locations rather than relying on PATH lookup.
+type WhisperBackend =
+  | { kind: 'mlx'; command: string }
+  | { kind: 'python-faster-whisper'; command: string };
 
-interface BinaryProbeCache {
-  value: string | null | undefined;
+interface BinaryProbeCache<T = string | null> {
+  value: T | undefined;
   checkedAt: number;
 }
 
-function isFreshMiss(cache: BinaryProbeCache): boolean {
+function isFreshMiss<T>(cache: BinaryProbeCache<T | null>): boolean {
   return cache.value === null && Date.now() - cache.checkedAt < NEGATIVE_BINARY_CACHE_MS;
 }
 
-/** Probe a list of candidate paths, returning the first that runs `--probe`-style check. */
+function expandWindowsPythonRoots(paths: string[]): string[] {
+  return paths.flatMap((base) => ([
+    join(base, 'python.exe'),
+    join(base, 'Scripts', 'python.exe'),
+  ]));
+}
+
+/** Probe a list of candidate paths, returning the first that runs the check args. */
 function resolveBinary(candidates: string[], checkArgs: string[]): string | null {
   for (const bin of candidates) {
     try {
-      const r = spawnSync(bin, checkArgs, { stdio: 'ignore' });
-      // status 0 (or null for tools that don't support the probe arg but exist) → usable
+      const r = spawnSync(bin, checkArgs, {
+        stdio: 'ignore',
+        windowsHide: process.platform === 'win32',
+      });
       if (r.error === undefined && (r.status === 0 || r.status === null)) {
         return bin;
       }
-    } catch { /* try next */ }
+    } catch {
+      // Try next candidate.
+    }
   }
   return null;
 }
@@ -48,7 +59,26 @@ let pythonCache: BinaryProbeCache = { value: undefined, checkedAt: 0 };
 function findPython(): string | null {
   if (pythonCache.value) return pythonCache.value;
   if (isFreshMiss(pythonCache)) return null;
+
+  const windowsPythonCandidates = process.platform === 'win32'
+    ? [
+        ...expandWindowsPythonRoots([
+          join(process.env.LOCALAPPDATA ?? '', 'Programs', 'Python', 'Python313'),
+          join(process.env.LOCALAPPDATA ?? '', 'Programs', 'Python', 'Python312'),
+          join(process.env.LOCALAPPDATA ?? '', 'Programs', 'Python', 'Python311'),
+          join(process.env.LOCALAPPDATA ?? '', 'Programs', 'Python', 'Python310'),
+          join(homedir(), 'miniforge3'),
+          join(homedir(), 'miniconda3'),
+          join(homedir(), 'anaconda3'),
+        ]),
+        'py',
+        'python',
+        'python3',
+      ]
+    : [];
+
   const candidates = [
+    ...windowsPythonCandidates,
     join(homedir(), 'miniforge3', 'bin', 'python3'),
     join(homedir(), 'miniconda3', 'bin', 'python3'),
     join(homedir(), 'anaconda3', 'bin', 'python3'),
@@ -56,61 +86,121 @@ function findPython(): string | null {
     '/usr/local/bin/python3',
     '/usr/bin/python3',
     'python3',
+    'python',
   ];
+
   for (const py of candidates) {
     try {
-      const r = spawnSync(py, ['-c', 'import pilk'], { stdio: 'ignore' });
+      const args = py === 'py' ? ['-3', '-c', 'import pilk'] : ['-c', 'import pilk'];
+      const r = spawnSync(py, args, {
+        stdio: 'ignore',
+        windowsHide: process.platform === 'win32',
+      });
       if (r.status === 0) {
         pythonCache = { value: py, checkedAt: Date.now() };
         logger.info('Found python with pilk', { python: py });
         return py;
       }
-    } catch { /* try next */ }
+    } catch {
+      // Try next candidate.
+    }
   }
+
   logger.warn('No python with pilk found — voice transcription unavailable');
   pythonCache = { value: null, checkedAt: Date.now() };
   return null;
 }
 
-let mlxWhisperCache: BinaryProbeCache = { value: undefined, checkedAt: 0 };
-function findMlxWhisper(): string | null {
-  if (mlxWhisperCache.value) return mlxWhisperCache.value;
-  if (isFreshMiss(mlxWhisperCache)) return null;
-  const mlxWhisper = resolveBinary([
-    join(homedir(), 'miniforge3', 'bin', 'mlx_whisper'),
-    join(homedir(), 'miniconda3', 'bin', 'mlx_whisper'),
-    join(homedir(), 'anaconda3', 'bin', 'mlx_whisper'),
-    '/opt/homebrew/bin/mlx_whisper',
-    '/usr/local/bin/mlx_whisper',
-    'mlx_whisper',
-  ], ['--help']);
-  mlxWhisperCache = { value: mlxWhisper, checkedAt: Date.now() };
-  if (mlxWhisper) logger.info('Found mlx_whisper', { path: mlxWhisper });
-  else logger.warn('mlx_whisper not found — voice transcription unavailable');
-  return mlxWhisper;
+let whisperBackendCache: BinaryProbeCache<WhisperBackend | null> = { value: undefined, checkedAt: 0 };
+function findWhisperBackend(python: string | null): WhisperBackend | null {
+  if (whisperBackendCache.value) return whisperBackendCache.value;
+  if (isFreshMiss(whisperBackendCache)) return null;
+
+  if (process.platform !== 'win32') {
+    const mlxWhisper = resolveBinary([
+      join(homedir(), 'miniforge3', 'bin', 'mlx_whisper'),
+      join(homedir(), 'miniconda3', 'bin', 'mlx_whisper'),
+      join(homedir(), 'anaconda3', 'bin', 'mlx_whisper'),
+      '/opt/homebrew/bin/mlx_whisper',
+      '/usr/local/bin/mlx_whisper',
+      'mlx_whisper',
+    ], ['--help']);
+    if (mlxWhisper) {
+      const backend: WhisperBackend = { kind: 'mlx', command: mlxWhisper };
+      whisperBackendCache = { value: backend, checkedAt: Date.now() };
+      logger.info('Found mlx_whisper', { path: mlxWhisper });
+      return backend;
+    }
+  }
+
+  if (python) {
+    try {
+      const args = python === 'py'
+        ? ['-3', '-c', 'from faster_whisper import WhisperModel']
+        : ['-c', 'from faster_whisper import WhisperModel'];
+      const r = spawnSync(python, args, {
+        stdio: 'ignore',
+        windowsHide: process.platform === 'win32',
+      });
+      if (r.status === 0) {
+        const backend: WhisperBackend = { kind: 'python-faster-whisper', command: python };
+        whisperBackendCache = {
+          value: backend,
+          checkedAt: Date.now(),
+        };
+        logger.info('Found faster-whisper python backend', { python });
+        return backend;
+      }
+    } catch {
+      // Fall through.
+    }
+  }
+
+  logger.warn('No whisper backend found — voice transcription unavailable');
+  whisperBackendCache = { value: null, checkedAt: Date.now() };
+  return null;
 }
 
 let ffmpegCache: BinaryProbeCache = { value: undefined, checkedAt: 0 };
 function findFfmpeg(): string | null {
   if (ffmpegCache.value) return ffmpegCache.value;
   if (isFreshMiss(ffmpegCache)) return null;
+
+  const windowsCandidates = process.platform === 'win32'
+    ? [
+        join('C:\\ffmpeg', 'bin', 'ffmpeg.exe'),
+        join(homedir(), 'scoop', 'shims', 'ffmpeg.exe'),
+        join(process.env.LOCALAPPDATA ?? '', 'Microsoft', 'WinGet', 'Links', 'ffmpeg.exe'),
+        'ffmpeg.exe',
+      ]
+    : [];
+
   const ffmpeg = resolveBinary([
+    ...windowsCandidates,
     '/opt/homebrew/bin/ffmpeg',
     '/usr/local/bin/ffmpeg',
     '/usr/bin/ffmpeg',
     join(homedir(), 'miniforge3', 'bin', 'ffmpeg'),
     'ffmpeg',
   ], ['-version']);
+
   ffmpegCache = { value: ffmpeg, checkedAt: Date.now() };
   if (ffmpeg) logger.info('Found ffmpeg', { path: ffmpeg });
   else logger.warn('ffmpeg not found — voice transcription unavailable');
   return ffmpeg;
 }
 
+function pythonCommandArgs(python: string, args: string[]): string[] {
+  return python === 'py' ? ['-3', ...args] : args;
+}
+
 /** Run a command with a timeout; resolves on exit 0, rejects on spawn error/timeout/non-zero. */
 function runCommand(cmd: string, args: string[], timeoutMs: number): Promise<void> {
   return new Promise((resolve, reject) => {
-    const child = spawn(cmd, args, { stdio: ['ignore', 'ignore', 'pipe'] });
+    const child = spawn(cmd, args, {
+      stdio: ['ignore', 'ignore', 'pipe'],
+      windowsHide: process.platform === 'win32',
+    });
     let settled = false;
     let timedOut = false;
     let stderrText = '';
@@ -131,9 +221,9 @@ function runCommand(cmd: string, args: string[], timeoutMs: number): Promise<voi
       }
     }, timeoutMs);
 
-    child.stderr?.on('data', (c) => {
+    child.stderr?.on('data', (chunk) => {
       if (stderrText.length < MAX_STDERR_CHARS) {
-        stderrText += String(c).slice(0, MAX_STDERR_CHARS - stderrText.length);
+        stderrText += String(chunk).slice(0, MAX_STDERR_CHARS - stderrText.length);
       }
     });
     child.on('error', (err) => {
@@ -160,7 +250,6 @@ function limitTranscript(text: string): string | null {
   return `${trimmed.slice(0, MAX_TRANSCRIPT_CHARS)}\n\n[语音转写过长，已截断]`;
 }
 
-/** Extract CDN download params from a voice item. */
 function getVoiceCdnData(item: MessageItem): { aesKey: string; encryptQueryParam: string } | null {
   const voice = item.voice_item;
   if (voice?.media?.aes_key && voice.media.encrypt_query_param) {
@@ -170,11 +259,41 @@ function getVoiceCdnData(item: MessageItem): { aesKey: string; encryptQueryParam
   return null;
 }
 
+function buildFasterWhisperScript(workDir: string): string {
+  const normalizedDir = workDir.replace(/\\/g, '\\\\');
+  return [
+    'import os',
+    'from faster_whisper import WhisperModel',
+    `work_dir = r"${normalizedDir}"`,
+    `model = WhisperModel(${JSON.stringify(FASTER_WHISPER_MODEL)}, device="auto", compute_type="auto")`,
+    'segments, _ = model.transcribe(os.path.join(work_dir, "voice.wav"), language="zh")',
+    'text = "".join(segment.text for segment in segments).strip()',
+    'with open(os.path.join(work_dir, "voice.txt"), "w", encoding="utf-8") as f:',
+    '    f.write(text)',
+  ].join('\n');
+}
+
+async function runWhisperBackend(backend: WhisperBackend, workDir: string, wavPath: string): Promise<void> {
+  if (backend.kind === 'mlx') {
+    await runCommand(backend.command, [
+      wavPath,
+      '--model', MLX_WHISPER_MODEL,
+      '--language', 'zh',
+      '--output-format', 'txt',
+      '--output-dir', workDir,
+      '--output-name', 'voice',
+      '--verbose', 'False',
+    ], WHISPER_TIMEOUT_MS);
+    return;
+  }
+
+  const script = buildFasterWhisperScript(workDir);
+  await runCommand(backend.command, pythonCommandArgs(backend.command, ['-c', script]), WHISPER_TIMEOUT_MS);
+}
+
 /**
- * Download a WeChat voice message, transcribe it locally with mlx_whisper,
- * and return the recognized text. Returns null on any failure.
- *
- * Pipeline: download+decrypt → SILK v3 (pilk) → PCM → ffmpeg wav → mlx_whisper.
+ * Download a WeChat voice message, transcribe it locally, and return the recognized text.
+ * Returns null when dependencies are missing or any step fails.
  */
 export async function transcribeVoice(item: MessageItem): Promise<string | null> {
   const cdnData = getVoiceCdnData(item);
@@ -184,8 +303,8 @@ export async function transcribeVoice(item: MessageItem): Promise<string | null>
   if (!python) return null;
   const ffmpeg = findFfmpeg();
   if (!ffmpeg) return null;
-  const mlxWhisper = findMlxWhisper();
-  if (!mlxWhisper) return null;
+  const whisperBackend = findWhisperBackend(python);
+  if (!whisperBackend) return null;
 
   const workDir = mkdtempSync(join(tmpdir(), 'wcc-voice-'));
   const silkPath = join(workDir, 'voice.silk');
@@ -193,47 +312,40 @@ export async function transcribeVoice(item: MessageItem): Promise<string | null>
   const wavPath = join(workDir, 'voice.wav');
 
   try {
-    // 1. Download + decrypt → SILK file
     const decrypted = await downloadAndDecrypt(cdnData.encryptQueryParam, cdnData.aesKey);
     if (decrypted.length > MAX_VOICE_DOWNLOAD_SIZE) {
       throw new Error(`Voice download too large: ${Math.round(decrypted.length / 1024 / 1024)}MB exceeds ${Math.round(MAX_VOICE_DOWNLOAD_SIZE / 1024 / 1024)}MB limit`);
     }
     writeFileSync(silkPath, decrypted);
 
-    // 2. SILK → PCM (16kHz) via pilk (handles Tencent's 0x02 prefix automatically)
-    await runCommand(python, [
+    await runCommand(python, pythonCommandArgs(python, [
       '-c',
       'import sys,pilk; pilk.decode(sys.argv[1], sys.argv[2], pcm_rate=16000)',
       silkPath, pcmPath,
-    ], SILK_TIMEOUT_MS);
+    ]), SILK_TIMEOUT_MS);
 
-    // 3. PCM → 16kHz mono wav (whisper's expected container)
     await runCommand(ffmpeg, [
       '-y', '-f', 's16le', '-ar', '16000', '-ac', '1', '-i', pcmPath, wavPath,
     ], FFMPEG_TIMEOUT_MS);
 
-    // 4. mlx_whisper transcription (zh handles Mandarin + embedded English well)
-    await runCommand(mlxWhisper, [
-      wavPath,
-      '--model', WHISPER_MODEL,
-      '--language', 'zh',
-      '--output-format', 'txt',
-      '--output-dir', workDir,
-      '--output-name', 'voice',
-      '--verbose', 'False',
-    ], WHISPER_TIMEOUT_MS);
+    await runWhisperBackend(whisperBackend, workDir, wavPath);
 
     const txtPath = join(workDir, 'voice.txt');
     if (!existsSync(txtPath)) {
       logger.warn('Whisper produced no output file');
       return null;
     }
+
     const txtSize = statSync(txtPath).size;
     if (txtSize > MAX_TRANSCRIPT_BYTES) {
       throw new Error(`Whisper output too large: ${txtSize} bytes exceeds ${MAX_TRANSCRIPT_BYTES} byte limit`);
     }
+
     const text = limitTranscript(readFileSync(txtPath, 'utf-8'));
-    logger.info('Voice transcribed', { length: text?.length ?? 0 });
+    logger.info('Voice transcribed', {
+      backend: whisperBackend.kind,
+      length: text?.length ?? 0,
+    });
     return text;
   } catch (err) {
     logger.warn('Voice transcription failed', { error: err instanceof Error ? err.message : String(err) });

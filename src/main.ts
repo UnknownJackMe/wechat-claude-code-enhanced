@@ -1336,7 +1336,7 @@ async function sendToClaude(
           // Scan directory for sendable files
           try {
             for (const entry of freaddirSync(p)) {
-              const full = `${p}/${entry}`;
+              const full = join(p, entry);
               const ext = fextname(entry).toLowerCase();
               if (AUTO_PUSH_EXTENSIONS.has(ext) && existsSync(full) && fstatSync(full).isFile()) {
                 pushable.push(full);

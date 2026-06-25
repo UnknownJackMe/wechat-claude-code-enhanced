@@ -1,9 +1,10 @@
-import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
+import type { ChildProcess } from 'node:child_process';
 import { writeFileSync, unlinkSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createInterface } from 'node:readline';
 import { logger } from '../logger.js';
+import { spawnClaude, spawnClaudeSync } from './cli.js';
 
 // ---------------------------------------------------------------------------
 // Version detection — cache result so we only spawn `claude --version` once
@@ -29,8 +30,9 @@ function getClaudeVersion(): number[] {
 
   let value: number[];
   try {
-    const r = spawnSync('claude', ['--version'], { encoding: 'utf8' });
-    const m = (r.stdout || '').match(/(\d+)\.(\d+)\.(\d+)/);
+    const r = spawnClaudeSync(['--version'], { encoding: 'utf8' });
+    const stdout = typeof r.stdout === 'string' ? r.stdout : r.stdout?.toString('utf8') ?? '';
+    const m = stdout.match(/(\d+)\.(\d+)\.(\d+)/);
     value = m ? [parseInt(m[1]), parseInt(m[2]), parseInt(m[3])] : [0, 0, 0];
   } catch {
     value = [0, 0, 0];
@@ -89,7 +91,7 @@ export async function validateModel(model: string, cwd: string): Promise<ModelVa
     };
 
     try {
-      child = spawn('claude', [
+      child = spawnClaude([
         '-p', 'reply with just: ok',
         '--model', model,
         '--output-format', 'json',
@@ -498,7 +500,7 @@ export async function claudeQuery(options: QueryOptions): Promise<QueryResult> {
     };
 
     try {
-      child = spawn('claude', args, {
+      child = spawnClaude(args, {
         cwd,
         stdio: ['pipe', 'pipe', 'pipe'],
         env: { ...process.env },

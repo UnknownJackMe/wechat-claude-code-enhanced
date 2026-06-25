@@ -81,7 +81,7 @@ export async function downloadImage(item: MessageItem): Promise<string | null> {
 
 export function extractText(item: MessageItem): string {
   if (item.text_item?.text) return item.text_item.text;
-  // Voice is transcribed locally (mlx_whisper) in main.ts, not via WeChat's built-in text.
+  // Voice is transcribed locally in main.ts, not via WeChat's built-in text field.
   if (item.file_item?.file_name) return `[用户发送了文件: ${item.file_item.file_name}]`;
   if (item.type === MessageItemType.VIDEO) return '[用户发送了视频]';
   return '';

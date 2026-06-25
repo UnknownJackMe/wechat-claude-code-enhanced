@@ -485,7 +485,7 @@ export function handleSend(ctx: CommandContext, args: string): CommandResult {
     if (st.isDirectory()) {
       const entries = readdirSync(p);
       const dirFiles = entries
-        .map(e => `${p}/${e}`)
+        .map(e => join(p, e))
         .filter(f => { try { return statSync(f).isFile() && SENDABLE_EXTENSIONS.has(extname(f).toLowerCase()); } catch { return false; } });
       if (dirFiles.length === 0) {
         return { reply: `目录为空或没有可发送的文件: ${p}`, handled: true };

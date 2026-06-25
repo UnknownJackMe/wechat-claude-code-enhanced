@@ -1,5 +1,6 @@
 import { existsSync, readdirSync, statSync } from 'node:fs';
-import { resolve, extname } from 'node:path';
+import { resolve, extname, join } from 'node:path';
+import { homedir } from 'node:os';
 import { isImageFile } from './upload.js';
 import { WeChatApi } from './api.js';
 import { MessageItemType, MessageType, MessageState, TypingStatus, type MessageItem, type OutboundMessage } from './types.js';
@@ -135,7 +136,7 @@ export function createSender(api: WeChatApi, botAccountId: string) {
   }
 
   async function sendFile(toUserId: string, contextToken: string, filePath: string): Promise<void> {
-    const resolved = resolve(filePath.replace(/^~/, process.env.HOME || ''));
+    const resolved = resolve(filePath.replace(/^~/, homedir()));
     if (!existsSync(resolved)) {
       await sendText(toUserId, contextToken, `文件不存在: ${resolved}`);
       return;
@@ -273,7 +274,7 @@ export function expandPaths(paths: string[]): string[] {
     const st = statSync(p);
     if (st.isDirectory()) {
       for (const entry of readdirSync(p)) {
-        const full = `${p}/${entry}`;
+        const full = join(p, entry);
         try {
           const est = statSync(full);
           if (est.isFile() && SENDABLE_EXTENSIONS.has(extname(entry).toLowerCase())) {

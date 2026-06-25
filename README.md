@@ -17,9 +17,19 @@
 
 ## 安装
 
+macOS / Linux:
+
 ```bash
 git clone https://github.com/UnknownJackMe/wechat-claude-code-enhanced.git ~/.claude/skills/wechat-claude-code
 cd ~/.claude/skills/wechat-claude-code && npm install
+```
+
+Windows PowerShell:
+
+```powershell
+git clone https://github.com/UnknownJackMe/wechat-claude-code-enhanced.git $HOME\.claude\skills\wechat-claude-code
+cd $HOME\.claude\skills\wechat-claude-code
+npm install
 ```
 
 首次扫码绑定与 daemon 管理：
@@ -32,17 +42,33 @@ npm run daemon -- restart    # 重启（更新代码后用）
 npm run daemon -- logs       # 查看日志
 ```
 
-### 可选：语音输入依赖（macOS）
+Windows 上 `npm run daemon -- start` 会自动创建计划任务并启动隐藏后台进程；`stop` 会同时停止进程并删除开机自启任务。
+
+### 可选：语音输入依赖
+
+macOS（Apple Silicon）:
+
+```bash
+pip install pilk
+brew install ffmpeg
+pip install mlx-whisper
+```
+
+Windows / Linux:
+
+```bash
+pip install pilk faster-whisper
+ffmpeg -version
+```
 
 如果想直接在微信发语音让 Claude 听懂，需要本地转录工具链：
 
-```bash
-pip install pilk          # 微信 SILK 语音编解码
-brew install ffmpeg       # 音频封装
-pip install mlx-whisper   # Apple Silicon 上的本地 whisper
-```
+- `pilk`：微信 SILK 语音编解码
+- `ffmpeg`：音频封装
+- `mlx-whisper`：macOS Apple Silicon 默认后端
+- `faster-whisper`：Windows / Linux 默认后端
 
-不装也不影响文字/图片/文件功能，只是发语音时无法转录。
+不装也不影响文字/图片/文件功能，只是发语音时会降级为“无法识别，请重发或直接打字”。
 
 ---
 
@@ -225,8 +251,8 @@ pip install mlx-whisper   # Apple Silicon 上的本地 whisper
 - 全程**本地运行**，语音内容不经过第三方云服务
 
 技术实现：微信语音是腾讯 SILK v3 格式（ffmpeg 不支持），处理链路为
-`下载解密 → pilk 解码成 PCM → ffmpeg 封装 wav → mlx_whisper 转录`。
-转录模型用 `mlx-community/whisper-large-v3-mlx`（Apple Silicon 原生加速，中英文俱佳）。所有外部程序均通过绝对路径探测，兼容 launchd 守护进程与终端 PATH 不一致的情况。
+`下载解密 → pilk 解码成 PCM → ffmpeg 封装 wav → whisper 后端转录`。
+macOS 默认用 `mlx_whisper` + `mlx-community/whisper-large-v3-mlx`；Windows / Linux 默认用 `faster-whisper`。所有外部程序都会先探测 PATH，再补常见安装路径，兼容 daemon 环境与交互式终端 PATH 不一致的情况。
 
 依赖安装见上文「安装 → 可选：语音输入依赖」。
 
