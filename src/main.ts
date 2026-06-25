@@ -487,7 +487,8 @@ async function runDaemon(): Promise<void> {
   const activeControllers = new Map<string, AbortController>();
 
   // -- Message queue for serial processing --
-  const messageQueue: WeixinMessage[] = [];
+  type QueueItem = { type: 'message'; msg: WeixinMessage } | { type: 'loop'; loopId: string; prompt: string };
+  const taskQueue: QueueItem[] = [];
   const MAX_QUEUE_SIZE = 50;
   let processingQueue = false;
 
@@ -495,12 +496,16 @@ async function runDaemon(): Promise<void> {
     if (processingQueue) return;
     processingQueue = true;
     try {
-      while (messageQueue.length > 0) {
-        const msg = messageQueue.shift()!;
+      while (taskQueue.length > 0) {
+        const item = taskQueue.shift()!;
         try {
-          await handleMessage(msg, account!, session, sessionStore, sender, config, sharedCtx, activeControllers, messageQueue);
+          if (item.type === 'message') {
+            await handleMessage(item.msg, account!, session, sessionStore, sender, config, sharedCtx, activeControllers);
+          } else if (item.type === 'loop') {
+            await executeLoopTask(item.loopId, item.prompt);
+          }
         } catch (err) {
-          logger.error('Failed to process queued message', { error: err instanceof Error ? err.message : String(err) });
+          logger.error('Failed to process queued task', { error: err instanceof Error ? err.message : String(err) });
         }
       }
     } finally {
@@ -561,7 +566,7 @@ async function runDaemon(): Promise<void> {
     sessionStore.save(account!.accountId, session);
 
     if (text.startsWith('/stop')) {
-      messageQueue.length = 0;
+      taskQueue.length = 0;
       sender.sendText(msg.from_user_id!, msg.context_token ?? '', '⏹ 已停止当前对话，排队中的消息已清空。').catch(() => {});
     }
     return true;
@@ -570,11 +575,14 @@ async function runDaemon(): Promise<void> {
   const callbacks: MonitorCallbacks = {
     onMessage: async (msg: WeixinMessage) => {
       if (handlePriorityCommand(msg)) return;
-      if (messageQueue.length >= MAX_QUEUE_SIZE) {
-        logger.warn('Message queue overflow, dropping message', { queueSize: messageQueue.length });
+      if (taskQueue.length >= MAX_QUEUE_SIZE) {
+        logger.warn('Message queue overflow, dropping message', { queueSize: taskQueue.length });
+        const fromId = msg.from_user_id;
+        const ctx = msg.context_token ?? '';
+        if (fromId) sender.sendText(fromId, ctx, '⚠️ 消息队列已满，请稍后再试。').catch(() => {});
         return;
       }
-      messageQueue.push(msg);
+      taskQueue.push({ type: 'message', msg });
       drainQueue().catch((err) => {
         logger.error('drainQueue unhandled error', { error: err instanceof Error ? err.message : String(err) });
       });
@@ -610,43 +618,51 @@ async function runDaemon(): Promise<void> {
   function scheduleLoop(loop: LoopEntry): void {
     if (loopTimers.has(loop.id)) return;
     const delay = Math.max(0, loop.nextFireAt - Date.now());
-    const timer = setTimeout(async () => {
+    const timer = setTimeout(() => {
       loopTimers.delete(loop.id);
       // Check loop still exists (may have been stopped)
       const current = loadLoops().find(l => l.id === loop.id);
       if (!current) return;
 
       logger.info('Loop firing', { id: loop.id, prompt: loop.prompt.slice(0, 60) });
-      const loopFromUserId = account!.userId || '';
-      const loopContextToken = sharedCtx.lastContextToken;
-      if (!loopFromUserId || !loopContextToken) {
-        logger.warn('Loop skipped: no user to send to', { id: loop.id });
-      } else {
-        try {
-          await sendToClaude(
-            `[🔁 定时任务] ${loop.prompt}`,
-            undefined, undefined,
-            loopFromUserId, loopContextToken,
-            account!, session, sessionStore, sender, config, activeControllers,
-          );
-        } catch (err) {
-          logger.error('Loop execution failed', { id: loop.id, error: err instanceof Error ? err.message : String(err) });
-        }
-      }
-
-      const latest = loadLoops().find(l => l.id === loop.id);
-      if (!latest) {
-        logger.info('Loop removed during execution, skipping reschedule', { id: loop.id });
-        clearLoopTimer(loop.id);
-        return;
-      }
-
-      // Reschedule
-      const nextFireAt = Date.now() + latest.intervalMs;
-      updateNextFire(loop.id, nextFireAt);
-      scheduleLoop({ ...latest, nextFireAt });
+      // Enqueue instead of calling sendToClaude directly to avoid concurrent mutations
+      taskQueue.push({ type: 'loop', loopId: loop.id, prompt: loop.prompt });
+      drainQueue().catch((err) => {
+        logger.error('drainQueue error from loop', { id: loop.id, error: err instanceof Error ? err.message : String(err) });
+      });
     }, delay);
     loopTimers.set(loop.id, timer);
+  }
+
+  async function executeLoopTask(loopId: string, prompt: string): Promise<void> {
+    const loopFromUserId = account!.userId || '';
+    const loopContextToken = sharedCtx.lastContextToken;
+    if (!loopFromUserId || !loopContextToken) {
+      logger.warn('Loop skipped: no user to send to', { id: loopId });
+    } else {
+      try {
+        await sendToClaude(
+          `[🔁 定时任务] ${prompt}`,
+          undefined, undefined,
+          loopFromUserId, loopContextToken,
+          account!, session, sessionStore, sender, config, activeControllers,
+        );
+      } catch (err) {
+        logger.error('Loop execution failed', { id: loopId, error: err instanceof Error ? err.message : String(err) });
+      }
+    }
+
+    const latest = loadLoops().find(l => l.id === loopId);
+    if (!latest) {
+      logger.info('Loop removed during execution, skipping reschedule', { id: loopId });
+      clearLoopTimer(loopId);
+      return;
+    }
+
+    // Reschedule
+    const nextFireAt = Date.now() + latest.intervalMs;
+    updateNextFire(loopId, nextFireAt);
+    scheduleLoop({ ...latest, nextFireAt });
   }
 
   // Restore loops that were active before restart
@@ -691,7 +707,6 @@ async function handleMessage(
   config: ReturnType<typeof loadConfig>,
   sharedCtx: { lastContextToken: string },
   activeControllers: Map<string, AbortController>,
-  messageQueue: WeixinMessage[],
 ): Promise<void> {
   // Filter: only user messages with required fields
   if (msg.message_type !== MessageType.USER) return;
@@ -1292,6 +1307,7 @@ async function sendToClaude(
     // If resume failed (e.g. corrupted session), retry without resume
     if (result.error && queryOptions.resume) {
       logger.warn('Resume failed, retrying without resume', { error: result.error, sessionId: queryOptions.resume });
+      await sender.sendText(fromUserId, contextToken, '⚠️ 无法恢复上次会话，已开始新对话。').catch(() => {});
       queryOptions.resume = undefined;
       session.sdkSessionId = undefined;
       saveSessionSafely(sessionStore, account.accountId, session, 'clear invalid resume before retry');
@@ -1309,17 +1325,21 @@ async function sendToClaude(
         logger.warn('Claude query had error but returned text, using text', { error: result.error });
       }
       sessionStore.addChatMessage(session, 'assistant', result.text);
-      // If streaming was unavailable or a streamed chunk failed after send retries,
-      // send the full result once at the end so failed mid-stream batches are not lost.
-      if (!anySent || streamFlushFailed) {
+      // Only send the full result if nothing was streamed at all.
+      // If streaming partially worked (anySent=true) but a later chunk failed,
+      // do NOT re-send the full text — that would duplicate already-sent content.
+      if (!anySent) {
         const chunks = splitMessage(result.text);
         for (const chunk of chunks) {
           await sender.sendText(fromUserId, contextToken, chunk);
         }
+      } else if (streamFlushFailed) {
+        logger.warn('Some streamed chunks failed to send, but partial content was already delivered');
       }
     } else if (result.error) {
       logger.error('Claude query error', { error: result.error });
-      await sender.sendText(fromUserId, contextToken, 'Claude 处理请求时出错，请稍后重试。');
+      const brief = result.error.length > 100 ? result.error.slice(0, 100) + '…' : result.error;
+      await sender.sendText(fromUserId, contextToken, `Claude 处理请求时出错: ${brief}`);
     } else if (!anySent) {
       await sender.sendText(fromUserId, contextToken, 'Claude 无返回内容（可能因权限被拒而终止）');
     }

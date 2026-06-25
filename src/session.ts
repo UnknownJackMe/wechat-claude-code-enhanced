@@ -104,6 +104,11 @@ export function createSessionStore() {
       state: 'idle',
       chatHistory: [],
       maxHistoryLength: currentSession?.maxHistoryLength || DEFAULT_MAX_HISTORY,
+      pendingSetup: undefined,
+      pendingFileUpload: undefined,
+      permissionMode: undefined,
+      effort: undefined,
+      advisor: undefined,
     };
     save(accountId, session);
     return session;

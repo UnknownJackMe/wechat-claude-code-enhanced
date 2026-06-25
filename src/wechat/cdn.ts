@@ -31,6 +31,14 @@ export async function downloadAndDecrypt(
 
   const encrypted = Buffer.from(await response.arrayBuffer());
 
+  // Validate encrypted data is block-aligned (AES-128-ECB requires multiples of 16)
+  if (encrypted.length === 0) {
+    throw new Error('CDN 返回空数据');
+  }
+  if (encrypted.length % 16 !== 0) {
+    throw new Error(`CDN 数据不完整（长度 ${encrypted.length} 不是 16 的倍数，可能传输截断）`);
+  }
+
   // Handle both formats:
   // 1. base64-of-raw-16-bytes (16 raw bytes encoded as base64)
   // 2. base64-of-hex-string (32 hex chars encoded as base64)
@@ -46,10 +54,18 @@ export async function downloadAndDecrypt(
     aesKey = Buffer.from(hexStr, "hex");
   }
 
-  const decrypted = decryptAesEcb(aesKey, encrypted);
-  logger.info("CDN download and decrypt succeeded", { size: decrypted.length });
+  // Validate key length before calling crypto
+  if (aesKey.length !== 16) {
+    throw new Error(`无效的 AES 密钥长度: ${aesKey.length} 字节（预期 16 字节）`);
+  }
 
-  return decrypted;
+  try {
+    const decrypted = decryptAesEcb(aesKey, encrypted);
+    logger.info("CDN download and decrypt succeeded", { size: decrypted.length });
+    return decrypted;
+  } catch (err) {
+    throw new Error(`CDN 解密失败: ${err instanceof Error ? err.message : String(err)}`);
+  }
 }
 
 function sanitizeErrorMessage(message: string): string {
