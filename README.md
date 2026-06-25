@@ -27,7 +27,7 @@ cd ~/.claude/skills/wechat-claude-code && npm install
 Windows PowerShell:
 
 ```powershell
-git clone https://github.com/UnknownJackMe/wechat-claude-code-enhanced.git $HOME\.claude\skills\wechat-claude-code
+git clone -b windows_version https://github.com/UnknownJackMe/wechat-claude-code-enhanced.git $HOME\.claude\skills\wechat-claude-code
 cd $HOME\.claude\skills\wechat-claude-code
 npm install
 ```
