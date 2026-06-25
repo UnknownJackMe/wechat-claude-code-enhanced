@@ -1,6 +1,6 @@
 import { join } from 'node:path';
 import { homedir } from 'node:os';
-import { loadJson, saveJson } from './store.js';
+import { loadJson, updateJson } from './store.js';
 
 const LOOPS_PATH = join(homedir(), '.wechat-claude-code', 'loops.json');
 const MAX_LOOPS = 20;
@@ -64,70 +64,80 @@ export function formatInterval(ms: number): string {
 // ID generation
 // ---------------------------------------------------------------------------
 
-function genId(): string {
-  return Math.random().toString(36).slice(2, 10);
+function genId(existing: LoopEntry[]): string {
+  const ids = new Set(existing.map(l => l.id));
+  let id: string;
+  do {
+    id = Math.random().toString(36).slice(2, 10);
+  } while (ids.has(id));
+  return id;
 }
 
 // ---------------------------------------------------------------------------
-// Persistence
+// Persistence — all mutations use updateJson for atomic read-modify-write
 // ---------------------------------------------------------------------------
 
-export function loadLoops(): LoopEntry[] {
+function pruneExpired(loops: LoopEntry[]): LoopEntry[] {
   const now = Date.now();
+  return loops.filter(l => now - l.createdAt < SEVEN_DAYS_MS);
+}
+
+export function loadLoops(): LoopEntry[] {
   const all = loadJson<LoopEntry[]>(LOOPS_PATH, []);
-  const pruned = all.filter(l => now - l.createdAt < SEVEN_DAYS_MS);
-  if (pruned.length !== all.length) {
-    // Persist pruning on load so expired entries do not consume MAX_LOOPS slots.
-    saveLoops(pruned);
-  }
+  const pruned = pruneExpired(all);
+  // NOTE: we don't persist pruning on bare reads to avoid lock overhead.
+  // Expired entries are cleaned on the next mutation.
   return pruned;
 }
 
-export function saveLoops(loops: LoopEntry[]): void {
-  saveJson(LOOPS_PATH, loops);
-}
-
 export function addLoop(entry: Omit<LoopEntry, 'id' | 'createdAt' | 'nextFireAt'>): LoopEntry {
-  const loops = loadLoops();
-  if (loops.length >= MAX_LOOPS) {
-    throw new Error(`已达最大 loop 数量 (${MAX_LOOPS})，请先停止部分 loop`);
-  }
-  const now = Date.now();
-  const loop: LoopEntry = {
-    ...entry,
-    id: genId(),
-    createdAt: now,
-    nextFireAt: now + entry.intervalMs,
-  };
-  loops.push(loop);
-  saveLoops(loops);
-  return loop;
+  let created: LoopEntry | undefined;
+  updateJson<LoopEntry[]>(LOOPS_PATH, [], (loops) => {
+    const pruned = pruneExpired(loops);
+    if (pruned.length >= MAX_LOOPS) {
+      throw new Error(`已达最大 loop 数量 (${MAX_LOOPS})，请先停止部分 loop`);
+    }
+    const now = Date.now();
+    created = {
+      ...entry,
+      id: genId(pruned),
+      createdAt: now,
+      nextFireAt: now + entry.intervalMs,
+    };
+    return [...pruned, created];
+  });
+  return created!;
 }
 
 export function removeLoop(id: string): boolean {
-  const loops = loadLoops();
-  const idx = loops.findIndex(l => l.id === id);
-  if (idx < 0) return false;
-  loops.splice(idx, 1);
-  saveLoops(loops);
-  return true;
+  let found = false;
+  updateJson<LoopEntry[]>(LOOPS_PATH, [], (loops) => {
+    const idx = loops.findIndex(l => l.id === id);
+    if (idx < 0) return loops;
+    found = true;
+    const copy = [...loops];
+    copy.splice(idx, 1);
+    return copy;
+  });
+  return found;
 }
 
 export function removeAllLoops(accountId: string): number {
-  const loops = loadLoops();
-  const kept = loops.filter(l => l.accountId !== accountId);
-  const removed = loops.length - kept.length;
-  saveLoops(kept);
+  let removed = 0;
+  updateJson<LoopEntry[]>(LOOPS_PATH, [], (loops) => {
+    const kept = loops.filter(l => l.accountId !== accountId);
+    removed = loops.length - kept.length;
+    return kept;
+  });
   return removed;
 }
 
 export function updateNextFire(id: string, nextFireAt: number): void {
-  const loops = loadLoops();
-  const loop = loops.find(l => l.id === id);
-  if (loop) {
-    loop.nextFireAt = nextFireAt;
-    saveLoops(loops);
-  }
+  updateJson<LoopEntry[]>(LOOPS_PATH, [], (loops) => {
+    const loop = loops.find(l => l.id === id);
+    if (loop) loop.nextFireAt = nextFireAt;
+    return loops;
+  });
 }
 
 export function getLoopsForAccount(accountId: string): LoopEntry[] {

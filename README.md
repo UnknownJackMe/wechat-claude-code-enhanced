@@ -72,6 +72,65 @@ ffmpeg -version
 
 ---
 
+
+```
+━━━ 会话管理 ━━━
+/help               显示帮助
+/status             查看当前会话状态
+/clear              清除当前会话（保留目录/模型设置）
+/reset              完全重置（恢复所有默认设置）
+/stop               停止当前对话并清空排队消息
+/compact            压缩上下文（保持 session ID）
+/history [数量]     查看对话记录（默认 20 条）
+/undo [数量]        撤销最近对话（默认 1 条）
+
+━━━ 对话恢复 ━━━
+/resume             列出当前目录的历史对话
+/resume <编号>      恢复指定编号的历史对话
+/resume <uuid>      通过 session ID 恢复
+
+━━━ 模型与权限 ━━━
+/model [别名/名称]  查看或切换模型（切换前自动验证可用性）
+/model-config       列出所有模型别名
+/model-config <别名> <完整ID>  添加/更新别名
+/model-config del <别名>       删除别名
+/mode [bypass|accept] 权限模式：全自动 / 逐个 y/n 确认
+/effort [级别]      思考强度（low/medium/high/xhigh/max）
+/advisor [模型]     Advisor 模型（opus/sonnet/fable/off）
+
+━━━ 任务控制 ━━━
+/q                  列出所有快捷指令
+/q <名字>           执行快捷指令
+/q set <名字> <内容> 添加/更新快捷指令
+/q del <名字>        删除快捷指令
+/goal [条件]        设置目标，Claude 持续工作直到完成
+/goal clear         清除当前目标
+/loop <间隔> <提示> 定时循环，例: /loop 5m 检查 CI
+/loop               列出所有运行中的 loop
+/loop stop <id>     停止指定 loop
+/loop stop all      停止所有 loop
+
+━━━ Workspace 配置 ━━━
+/configs                  列出所有 workspace 配置
+/set-config <编号>        向导式创建/编辑配置
+/switch-config <编号>     一键切换（目录+模型+session）
+/delete-config <编号>     删除配置
+
+━━━ 文件与工具 ━━━
+/cwd [路径]         查看或切换工作目录
+/prompt [内容]      查看或设置系统提示词
+/send-me <路径>     发送本地文件给你（支持多路径、目录）
+/send-you           开始接收你发来的文件/图片
+/send-you-end [要求] 结束接收，将文件+图片发给 Claude
+/send-you-cancel    取消文件接收
+/skills [full]      列出已安装的 skill
+/version            查看版本信息
+```
+
+此外，**直接发文字/语音/图片/文件**即可与 Claude Code 对话；Claude 提出的选择题和需要确认的操作也会自动推送到微信（见下文）。
+
+---
+
 ## 命令使用方法
 
 ### `/resume` — 历史对话恢复
@@ -290,63 +349,3 @@ macOS 默认用 `mlx_whisper` + `mlx-community/whisper-large-v3-mlx`；Windows /
 ## License
 
 MIT
-
-```
-━━━ 会话管理 ━━━
-/help               显示帮助
-/status             查看当前会话状态
-/clear              清除当前会话（保留目录/模型设置）
-/reset              完全重置（恢复所有默认设置）
-/stop               停止当前对话并清空排队消息
-/compact            压缩上下文（保持 session ID）
-/history [数量]     查看对话记录（默认 20 条）
-/undo [数量]        撤销最近对话（默认 1 条）
-
-━━━ 对话恢复 ━━━
-/resume             列出当前目录的历史对话
-/resume <编号>      恢复指定编号的历史对话
-/resume <uuid>      通过 session ID 恢复
-
-━━━ 模型与权限 ━━━
-/model [别名/名称]  查看或切换模型（切换前自动验证可用性）
-/model-config       列出所有模型别名
-/model-config <别名> <完整ID>  添加/更新别名
-/model-config del <别名>       删除别名
-/mode [bypass|accept] 权限模式：全自动 / 逐个 y/n 确认
-/effort [级别]      思考强度（low/medium/high/xhigh/max）
-/advisor [模型]     Advisor 模型（opus/sonnet/fable/off）
-
-━━━ 任务控制 ━━━
-/q                  列出所有快捷指令
-/q <名字>           执行快捷指令
-/q set <名字> <内容> 添加/更新快捷指令
-/q del <名字>        删除快捷指令
-/goal [条件]        设置目标，Claude 持续工作直到完成
-/goal clear         清除当前目标
-/loop <间隔> <提示> 定时循环，例: /loop 5m 检查 CI
-/loop               列出所有运行中的 loop
-/loop stop <id>     停止指定 loop
-/loop stop all      停止所有 loop
-
-━━━ Workspace 配置 ━━━
-/configs                  列出所有 workspace 配置
-/set-config <编号>        向导式创建/编辑配置
-/switch-config <编号>     一键切换（目录+模型+session）
-/delete-config <编号>     删除配置
-
-━━━ 文件与工具 ━━━
-/cwd [路径]         查看或切换工作目录
-/prompt [内容]      查看或设置系统提示词
-/send-me <路径>     发送本地文件给你（支持多路径、目录）
-/send-you           开始接收你发来的文件/图片
-/send-you-end [要求] 结束接收，将文件+图片发给 Claude
-/send-you-cancel    取消文件接收
-/skills [full]      列出已安装的 skill
-/version            查看版本信息
-```
-
-此外，**直接发文字/语音/图片/文件**即可与 Claude Code 对话；Claude 提出的选择题和需要确认的操作也会自动推送到微信（见下文）。
-
----
-
-## 命令使用方法

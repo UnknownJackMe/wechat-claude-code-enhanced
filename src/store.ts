@@ -98,7 +98,18 @@ export function saveJson(filePath: string, data: unknown): void {
   try {
     // Write to a sibling temp file first so concurrent writers never expose partial JSON.
     writeFileSync(tempPath, raw, { encoding: "utf-8", mode: 0o600 });
-    renameSync(tempPath, filePath);
+    try {
+      renameSync(tempPath, filePath);
+    } catch (renameErr) {
+      // On Windows, renameSync over an existing file can throw EEXIST.
+      // Fallback: remove the target first, then retry the rename.
+      if ((renameErr as NodeJS.ErrnoException).code === 'EEXIST' || (renameErr as NodeJS.ErrnoException).code === 'EPERM') {
+        try { unlinkSync(filePath); } catch { /* target may have been removed concurrently */ }
+        renameSync(tempPath, filePath);
+      } else {
+        throw renameErr;
+      }
+    }
     if (process.platform !== 'win32') {
       chmodSync(filePath, 0o600);
     }

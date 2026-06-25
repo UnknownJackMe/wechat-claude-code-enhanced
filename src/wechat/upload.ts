@@ -101,6 +101,7 @@ export async function uploadFile(
 
 async function uploadToCdn(url: string, encrypted: Buffer): Promise<string> {
   const MAX_RETRIES = 3;
+  const RETRY_DELAYS_MS = [1_000, 3_000, 6_000];
 
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     const controller = new AbortController();
@@ -121,6 +122,8 @@ async function uploadToCdn(url: string, encrypted: Buffer): Promise<string> {
 
       if (res.status >= 500) {
         logger.warn('CDN upload 5xx, retrying', { status: res.status, attempt });
+        const delay = RETRY_DELAYS_MS[attempt] ?? 6_000;
+        await new Promise(r => setTimeout(r, delay));
         continue;
       }
 

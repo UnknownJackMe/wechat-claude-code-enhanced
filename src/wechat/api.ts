@@ -19,9 +19,11 @@ export class WeChatApi {
   private readonly baseUrl: string;
   private readonly uin: string;
   private readonly nextSendTime = new Map<string, number>();
+  private readonly sendLocks = new Map<string, Promise<void>>();
   private static readonly MIN_SEND_INTERVAL = 4000;
   private static readonly MAX_SEND_SLOT_WAIT = 60_000;
   private static readonly RETRY_BACKOFFS_MS = [3_000, 6_000, 12_000, 24_000, 30_000, 30_000];
+  private static readonly MAX_SEND_TIME_ENTRIES = 100;
 
   constructor(token: string, baseUrl: string = 'https://ilinkai.weixin.qq.com') {
     if (baseUrl) {
@@ -100,22 +102,41 @@ export class WeChatApi {
   private async waitForSendSlot(userId?: string): Promise<void> {
     if (!userId) return;
 
-    const now = Date.now();
-    let nextAvailable = this.nextSendTime.get(userId) ?? now;
-    if (nextAvailable - now > WeChatApi.MAX_SEND_SLOT_WAIT) {
-      logger.warn('Rate limiter slot too far in the future, resetting', {
-        userId,
-        waitMs: nextAvailable - now,
-      });
-      nextAvailable = now;
-    }
+    // Serialize per-user to prevent concurrent sends from reading the same slot
+    const prev = this.sendLocks.get(userId) ?? Promise.resolve();
+    let unlock: () => void;
+    const gate = new Promise<void>(r => { unlock = r; });
+    this.sendLocks.set(userId, gate);
+    await prev;
 
-    const sendAt = Math.max(now, nextAvailable);
-    this.nextSendTime.set(userId, sendAt + WeChatApi.MIN_SEND_INTERVAL);
-    const waitMs = sendAt - now;
-    if (waitMs > 0) {
-      logger.debug('Rate limiter waiting', { userId, waitMs });
-      await new Promise(r => setTimeout(r, waitMs));
+    try {
+      // Prune stale entries to prevent unbounded map growth
+      if (this.nextSendTime.size > WeChatApi.MAX_SEND_TIME_ENTRIES) {
+        const now = Date.now();
+        for (const [key, time] of this.nextSendTime) {
+          if (time < now) this.nextSendTime.delete(key);
+        }
+      }
+
+      const now = Date.now();
+      let nextAvailable = this.nextSendTime.get(userId) ?? now;
+      if (nextAvailable - now > WeChatApi.MAX_SEND_SLOT_WAIT) {
+        logger.warn('Rate limiter slot too far in the future, resetting', {
+          userId,
+          waitMs: nextAvailable - now,
+        });
+        nextAvailable = now;
+      }
+
+      const sendAt = Math.max(now, nextAvailable);
+      this.nextSendTime.set(userId, sendAt + WeChatApi.MIN_SEND_INTERVAL);
+      const waitMs = sendAt - now;
+      if (waitMs > 0) {
+        logger.debug('Rate limiter waiting', { userId, waitMs });
+        await new Promise(r => setTimeout(r, waitMs));
+      }
+    } finally {
+      unlock!();
     }
   }
 

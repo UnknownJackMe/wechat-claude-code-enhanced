@@ -11,7 +11,7 @@ import { saveAccount, loadLatestAccount, type AccountData } from './wechat/accou
 import { startQrLogin, waitForQrScan } from './wechat/login.js';
 import { createMonitor, type MonitorCallbacks } from './wechat/monitor.js';
 import { createSender } from './wechat/send.js';
-import { downloadImage, extractText, extractFirstImageUrl, extractFirstFileItem, extractFirstVoiceItem, downloadFile, downloadAllMedia } from './wechat/media.js';
+import { downloadImage, extractText, extractFirstImageUrl, extractFirstFileItem, extractFirstVoiceItem, downloadFile, downloadAllMedia, cleanupTempDownloads } from './wechat/media.js';
 import { createSessionStore, type Session } from './session.js';
 import { routeCommand, handleSetupWizard, type CommandContext, type CommandResult } from './commands/router.js';
 import { claudeQuery, validateModel, type QueryOptions, type PermissionRequest, type QuestionItem } from './claude/provider.js';
@@ -466,6 +466,7 @@ async function runDaemon(): Promise<void> {
   const api = new WeChatApi(account.botToken, account.baseUrl);
   const sessionStore = createSessionStore();
   clearStalePendingUploads(sessionStore);
+  cleanupTempDownloads();
   const session: Session = sessionStore.load(account.accountId);
 
   // Fix: backfill session workingDirectory from config if it's still the default process.cwd()
@@ -487,6 +488,7 @@ async function runDaemon(): Promise<void> {
 
   // -- Message queue for serial processing --
   const messageQueue: WeixinMessage[] = [];
+  const MAX_QUEUE_SIZE = 50;
   let processingQueue = false;
 
   async function drainQueue(): Promise<void> {
@@ -568,8 +570,14 @@ async function runDaemon(): Promise<void> {
   const callbacks: MonitorCallbacks = {
     onMessage: async (msg: WeixinMessage) => {
       if (handlePriorityCommand(msg)) return;
+      if (messageQueue.length >= MAX_QUEUE_SIZE) {
+        logger.warn('Message queue overflow, dropping message', { queueSize: messageQueue.length });
+        return;
+      }
       messageQueue.push(msg);
-      drainQueue();
+      drainQueue().catch((err) => {
+        logger.error('drainQueue unhandled error', { error: err instanceof Error ? err.message : String(err) });
+      });
     },
     onSessionExpired: () => {
       logger.warn('Session expired, will keep retrying...');

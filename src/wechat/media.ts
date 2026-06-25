@@ -182,3 +182,45 @@ export async function downloadAllMedia(
   }
   return results;
 }
+
+// ---------------------------------------------------------------------------
+// Temp file cleanup — removes files older than maxAgeMs from download dirs.
+// ---------------------------------------------------------------------------
+
+const TEMP_DIRS = [
+  path.join(os.tmpdir(), 'wechat-claude-code'),
+  path.join(os.tmpdir(), 'wechat-claude-uploads'),
+];
+
+const DEFAULT_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+export function cleanupTempDownloads(maxAgeMs: number = DEFAULT_MAX_AGE_MS): number {
+  const cutoff = Date.now() - maxAgeMs;
+  let removed = 0;
+
+  for (const dir of TEMP_DIRS) {
+    let entries: string[];
+    try {
+      entries = fs.readdirSync(dir);
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      const full = path.join(dir, entry);
+      try {
+        const st = fs.statSync(full);
+        if (st.isFile() && st.mtimeMs < cutoff) {
+          fs.unlinkSync(full);
+          removed++;
+        }
+      } catch {
+        // Skip files that can't be stat'd or deleted (in use, etc.)
+      }
+    }
+  }
+
+  if (removed > 0) {
+    logger.info('Cleaned up stale temp downloads', { removed, maxAgeMs });
+  }
+  return removed;
+}

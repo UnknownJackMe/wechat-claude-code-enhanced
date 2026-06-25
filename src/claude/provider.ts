@@ -396,10 +396,10 @@ export async function claudeQuery(options: QueryOptions): Promise<QueryResult> {
         clearTimeout(timeoutId);
         timeoutId = undefined;
       }
-      if (forceKillTimer) {
-        clearTimeout(forceKillTimer);
-        forceKillTimer = undefined;
-      }
+      // NOTE: forceKillTimer is intentionally NOT cleared here.
+      // On Windows, SIGTERM is a no-op so SIGKILL escalation must survive
+      // past finish(). The timer self-cleans after firing or when the child
+      // emits 'close'.
       cleanupTempFiles(tempImagePaths);
     };
 
@@ -536,11 +536,16 @@ export async function claudeQuery(options: QueryOptions): Promise<QueryResult> {
     abortController?.signal.addEventListener('abort', onAbort, { once: true });
     abortListenerRegistered = !!abortController;
 
-    // Collect stderr
+    // Collect stderr (capped to prevent unbounded memory growth)
     const stderrParts: string[] = [];
+    let stderrBytes = 0;
+    const MAX_STDERR_BYTES = 64 * 1024; // 64KB
     child.stderr!.setEncoding('utf8');
     child.stderr!.on('data', (chunk: string) => {
-      stderrParts.push(chunk);
+      if (stderrBytes < MAX_STDERR_BYTES) {
+        stderrParts.push(chunk);
+        stderrBytes += Buffer.byteLength(chunk, 'utf8');
+      }
     });
     child.stderr!.on('error', (err: Error) => {
       logger.warn('Claude CLI stderr stream errored', { message: err.message });
@@ -716,6 +721,12 @@ export async function claudeQuery(options: QueryOptions): Promise<QueryResult> {
 
     // Handle process exit
     child.on('close', (code: number | null) => {
+      // Child is dead — cancel the SIGKILL escalation timer if still pending.
+      if (forceKillTimer) {
+        clearTimeout(forceKillTimer);
+        forceKillTimer = undefined;
+      }
+
       if (code !== 0 && code !== null && !textParts.length && !errorMessage) {
         const stderr = stderrParts.join('').trim();
         errorMessage = stderr || `claude exited with code ${code}`;

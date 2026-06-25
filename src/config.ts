@@ -1,7 +1,9 @@
-import { readFileSync, writeFileSync, mkdirSync, chmodSync } from "node:fs";
+import { readFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { DEFAULT_WORKING_DIR } from "./constants.js";
+import { saveJson } from "./store.js";
+import { logger } from "./logger.js";
 
 export interface Config {
   workingDirectory: string;
@@ -27,22 +29,25 @@ export function loadConfig(): Config {
     };
     mkdirSync(config.workingDirectory, { recursive: true });
     return config;
-  } catch {
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      logger.warn('loadConfig failed, using defaults', { error: err instanceof Error ? err.message : String(err) });
+    }
     const config = { ...DEFAULT_CONFIG };
-    mkdirSync(config.workingDirectory, { recursive: true });
+    try {
+      mkdirSync(config.workingDirectory, { recursive: true });
+    } catch {
+      // Working directory may be invalid; proceed with the default path in memory.
+    }
     return config;
   }
 }
 
 export function saveConfig(config: Config): void {
-  mkdirSync(CONFIG_DIR, { recursive: true });
   const data: Record<string, string> = {
     workingDirectory: config.workingDirectory,
   };
   if (config.model) data.model = config.model;
   if (config.systemPrompt) data.systemPrompt = config.systemPrompt;
-  writeFileSync(CONFIG_PATH, JSON.stringify(data, null, 2) + "\n", "utf-8");
-  if (process.platform !== "win32") {
-    chmodSync(CONFIG_PATH, 0o600);
-  }
+  saveJson(CONFIG_PATH, data);
 }

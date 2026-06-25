@@ -30,7 +30,20 @@ function sleep(ms: number): Promise<void> {
 export async function startQrLogin(): Promise<{ qrcodeUrl: string; qrcodeId: string }> {
   logger.info('Requesting QR code');
 
-  const res = await fetch(QR_CODE_URL);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15_000);
+  let res: Response;
+  try {
+    res = await fetch(QR_CODE_URL, { signal: controller.signal });
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'AbortError') {
+      throw new Error('获取二维码超时（15s）');
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+
   if (!res.ok) {
     throw new Error(`Failed to get QR code: HTTP ${res.status}`);
   }

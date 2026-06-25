@@ -11,11 +11,14 @@ const TYPING_KEEPALIVE_MS = 5_000;
 const TYPING_REQUEST_TIMEOUT_MS = 12_000;
 const TYPING_CANCEL_TIMEOUT_MS = 3_000;
 const SEND_FILE_RATE_LIMIT_RETRY_DELAYS_MS = [500, 1_000, 2_000];
+const SEND_TEXT_TIMEOUT_MS = 15_000;
+const SEND_TEXT_RETRY_DELAYS_MS = [300, 1_000, 2_000];
 
 export function createSender(api: WeChatApi, botAccountId: string) {
   let clientCounter = 0;
   const typingTicketCache = new Map<string, { ticket: string; fetchedAt: number }>();
   const TICKET_TTL = 24 * 60 * 60 * 1000;
+  const MAX_TICKET_CACHE_SIZE = 100;
 
   function generateClientId(): string {
     return `wcc-${Date.now()}-${++clientCounter}`;
@@ -25,6 +28,13 @@ export function createSender(api: WeChatApi, botAccountId: string) {
     const cached = typingTicketCache.get(userId);
     if (cached && Date.now() - cached.fetchedAt < TICKET_TTL) {
       return cached.ticket;
+    }
+    // Prune stale entries to prevent unbounded growth
+    if (typingTicketCache.size > MAX_TICKET_CACHE_SIZE) {
+      const now = Date.now();
+      for (const [key, val] of typingTicketCache) {
+        if (now - val.fetchedAt >= TICKET_TTL) typingTicketCache.delete(key);
+      }
     }
     try {
       const resp = await api.getConfig(userId, contextToken, signal);
@@ -131,8 +141,26 @@ export function createSender(api: WeChatApi, botAccountId: string) {
     };
 
     logger.info('Sending text message', { toUserId, clientId, textLength: text.length });
-    await api.sendMessage({ msg });
-    logger.info('Text message sent', { toUserId, clientId });
+
+    let lastErr: unknown;
+    for (let attempt = 0; attempt <= SEND_TEXT_RETRY_DELAYS_MS.length; attempt++) {
+      try {
+        await withTimeout(api.sendMessage({ msg }), SEND_TEXT_TIMEOUT_MS, 'sendText');
+        logger.info('Text message sent', { toUserId, clientId });
+        return;
+      } catch (err) {
+        lastErr = err;
+        if (attempt < SEND_TEXT_RETRY_DELAYS_MS.length) {
+          logger.warn('sendText failed, retrying', {
+            attempt: attempt + 1,
+            error: err instanceof Error ? err.message : String(err),
+          });
+          await new Promise(r => setTimeout(r, SEND_TEXT_RETRY_DELAYS_MS[attempt]));
+        }
+      }
+    }
+    // All retries exhausted — throw last error
+    throw lastErr;
   }
 
   async function sendFile(toUserId: string, contextToken: string, filePath: string): Promise<void> {
@@ -189,7 +217,7 @@ export function createSender(api: WeChatApi, botAccountId: string) {
       };
 
       logger.info('Sending file message', { toUserId, clientId, fileName: media.fileName, mediaType: media.mediaType });
-      await api.sendMessage({ msg });
+      await withTimeout(api.sendMessage({ msg }), SEND_TEXT_TIMEOUT_MS, 'sendFile');
       logger.info('File message sent', { toUserId, clientId, fileName: media.fileName });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
