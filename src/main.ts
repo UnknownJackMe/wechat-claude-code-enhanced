@@ -14,7 +14,7 @@ import { createSender } from './wechat/send.js';
 import { downloadImage, extractText, extractFirstImageUrl, extractFirstFileItem, extractFirstVoiceItem, downloadFile, downloadAllMedia } from './wechat/media.js';
 import { createSessionStore, type Session } from './session.js';
 import { routeCommand, handleSetupWizard, type CommandContext, type CommandResult } from './commands/router.js';
-import { claudeQuery, validateModel, type QueryOptions, type PermissionRequest } from './claude/provider.js';
+import { claudeQuery, validateModel, type QueryOptions, type PermissionRequest, type QuestionItem } from './claude/provider.js';
 import { transcribeVoice } from './wechat/voice-transcribe.js';
 import { loadConfig, saveConfig } from './config.js';
 import { logger } from './logger.js';
@@ -88,6 +88,89 @@ function formatApprovalRequest(req: PermissionRequest): string {
   if (req.decisionReason) lines.push('', `_${req.decisionReason}_`);
   lines.push('', '回复 **y** 批准 / **n** 拒绝（30 秒有效）');
   return lines.join('\n');
+}
+
+// -- Pending AskUserQuestion (works in any permission mode) --
+// When Claude calls AskUserQuestion, we park a resolver here, push the options to
+// WeChat, and the user's reply (option number(s) or text) resolves it. The answer
+// text is fed back to the CLI as the tool result.
+interface PendingQuestion {
+  accountId: string;
+  resolve: (answer: string) => void;
+  questions: QuestionItem[];
+  timer: ReturnType<typeof setTimeout>;
+}
+const pendingQuestions = new Map<string, PendingQuestion>();
+const QUESTION_TIMEOUT_MS = 5 * 60_000; // 5 min — choosing needs more thought than y/n
+
+/** Format an AskUserQuestion request as a numbered WeChat message. */
+function formatQuestionRequest(questions: QuestionItem[]): string {
+  const lines: string[] = ['**🤔 需要你做个选择**', ''];
+  questions.forEach((q, qi) => {
+    if (questions.length > 1) lines.push(`**问题 ${qi + 1}：${q.question}**`);
+    else lines.push(`**${q.question}**`);
+    (q.options || []).forEach((opt, oi) => {
+      const num = questions.length > 1 ? `${qi + 1}.${oi + 1}` : `${oi + 1}`;
+      lines.push(`${num}. ${opt.label}${opt.description ? ` — ${opt.description}` : ''}`);
+    });
+    if (q.multiSelect) lines.push('（可多选，用逗号分隔，如 1,3）');
+    lines.push('');
+  });
+  lines.push('回复选项编号即可（5 分钟内有效）。也可直接打字回答。');
+  return lines.join('\n');
+}
+
+/**
+ * Map a user's reply to an answer string for AskUserQuestion.
+ * Accepts option numbers ("1", "2,3", "1.2"), option labels, or free text.
+ * Returns the answer text to feed back as the tool result.
+ */
+function mapQuestionReply(reply: string, questions: QuestionItem[]): string {
+  const trimmed = reply.trim();
+  const parts: string[] = [];
+
+  questions.forEach((q, qi) => {
+    const opts = q.options || [];
+    // Collect tokens that target this question: "N", "Q.N", or label match.
+    const picked: string[] = [];
+    for (const tok of trimmed.split(/[,，\s]+/).filter(Boolean)) {
+      // "q.o" form for multi-question
+      const dotted = tok.match(/^(\d+)\.(\d+)$/);
+      if (dotted && questions.length > 1) {
+        if (parseInt(dotted[1], 10) === qi + 1) {
+          const oi = parseInt(dotted[2], 10) - 1;
+          if (opts[oi]) picked.push(opts[oi].label);
+        }
+        continue;
+      }
+      // plain number — only meaningful for single-question case
+      if (/^\d+$/.test(tok) && questions.length === 1) {
+        const oi = parseInt(tok, 10) - 1;
+        if (opts[oi]) picked.push(opts[oi].label);
+        continue;
+      }
+      // label text match (case-insensitive)
+      const byLabel = opts.find(o => o.label.toLowerCase() === tok.toLowerCase());
+      if (byLabel) picked.push(byLabel.label);
+    }
+    if (picked.length > 0) {
+      parts.push(`${q.header || q.question}：${[...new Set(picked)].join('、')}`);
+    }
+  });
+
+  // If nothing matched, treat the whole reply as a free-text answer.
+  if (parts.length === 0) return `用户回答：${trimmed}`;
+  return parts.map(p => `用户选择了 ${p}`).join('；');
+}
+
+/** Resolve a parked question for an account. Returns true if one existed. */
+function resolveQuestion(accountId: string, answer: string): boolean {
+  const pending = pendingQuestions.get(accountId);
+  if (!pending) return false;
+  clearTimeout(pending.timer);
+  pendingQuestions.delete(accountId);
+  pending.resolve(answer);
+  return true;
 }
 
 // Extensions eligible for auto-push when detected in Claude's response
@@ -446,6 +529,23 @@ async function runDaemon(): Promise<void> {
       } else {
         // Any other message while awaiting approval: remind the user.
         sender.sendText(msg.from_user_id!, msg.context_token ?? '', '⏳ 正在等待你确认上一个操作，请回复 y 批准 / n 拒绝。').catch(() => {});
+        return true;
+      }
+    }
+
+    // Question reply — only meaningful while an AskUserQuestion is pending.
+    if (pendingQuestions.has(account!.accountId)) {
+      // /stop and /clear abort the question, then fall through to cancel the turn.
+      if (text.startsWith('/stop') || text.startsWith('/clear')) {
+        resolveQuestion(account!.accountId, '用户中止了对话，未作答。');
+      } else if (text) {
+        const pending = pendingQuestions.get(account!.accountId)!;
+        const answer = mapQuestionReply(text, pending.questions);
+        resolveQuestion(account!.accountId, answer);
+        sender.sendText(msg.from_user_id!, msg.context_token ?? '', `✅ 已记录你的选择`).catch(() => {});
+        return true;
+      } else {
+        sender.sendText(msg.from_user_id!, msg.context_token ?? '', '⏳ 正在等待你选择，请回复选项编号。').catch(() => {});
         return true;
       }
     }
@@ -1135,6 +1235,27 @@ async function sendToClaude(
             sender.sendText(fromUserId, contextToken, detail).catch(() => {});
           })
         : undefined,
+      // AskUserQuestion → push options to WeChat, park resolver until user replies.
+      // Active in any permission mode (the provider turns on stdio prompt for it).
+      onQuestionRequest: (req) => new Promise<string>((resolveAnswer) => {
+        const timer = setTimeout(() => {
+          if (pendingQuestions.get(account.accountId)?.resolve === resolveAnswer) {
+            pendingQuestions.delete(account.accountId);
+          }
+          sender.sendText(fromUserId, contextToken, '⏱ 5 分钟未选择，已跳过。Claude 将自行继续。').catch(() => {});
+          resolveAnswer('用户未在限时内作答。');
+        }, QUESTION_TIMEOUT_MS);
+        // Replace any stale pending question so no resolver/timer is orphaned.
+        const prev = pendingQuestions.get(account.accountId);
+        if (prev) { clearTimeout(prev.timer); prev.resolve('新的问题已到达，旧问题已跳过。'); }
+        pendingQuestions.set(account.accountId, {
+          accountId: account.accountId,
+          resolve: resolveAnswer,
+          questions: req.questions,
+          timer,
+        });
+        sender.sendText(fromUserId, contextToken, formatQuestionRequest(req.questions)).catch(() => {});
+      }),
       onText: async (delta: string) => {
         textBuffer += delta;
 
@@ -1249,8 +1370,9 @@ async function sendToClaude(
   } finally {
     clearInterval(flushTimer);
     stopTyping();
-    // Clean up any lingering pending approval for this account (e.g. query ended/aborted mid-prompt).
+    // Clean up any lingering pending approval/question for this account.
     resolveApproval(account.accountId, 'deny', '对话已结束');
+    resolveQuestion(account.accountId, '对话已结束，未作答。');
     resetSessionStateSafely(sessionStore, account.accountId, session, 'sendToClaude finally');
     // Clean up the abort controller if it's still ours
     if (activeControllers.get(account.accountId) === abortController) {

@@ -175,6 +175,23 @@ export interface PermissionDecision {
   updatedInput?: any;
 }
 
+export interface QuestionOption {
+  label: string;
+  description?: string;
+}
+
+export interface QuestionItem {
+  question: string;
+  header?: string;
+  multiSelect?: boolean;
+  options: QuestionOption[];
+}
+
+export interface QuestionRequest {
+  requestId: string;
+  questions: QuestionItem[];
+}
+
 export interface QueryOptions {
   prompt: string;
   cwd: string;
@@ -188,6 +205,12 @@ export interface QueryOptions {
   permissionMode?: 'bypass' | 'approve';
   /** Called in approve mode when the CLI requests permission for a tool. Resolve with allow/deny. */
   onPermissionRequest?: (req: PermissionRequest) => Promise<PermissionDecision>;
+  /**
+   * Called when Claude invokes AskUserQuestion. Return the user's answer text
+   * (becomes the tool result). Works in any permission mode as long as
+   * --permission-prompt-tool stdio is active.
+   */
+  onQuestionRequest?: (req: QuestionRequest) => Promise<string>;
   images?: Array<{
     type: "image";
     source: { type: "base64"; media_type: string; data: string };
@@ -251,6 +274,7 @@ export async function claudeQuery(options: QueryOptions): Promise<QueryResult> {
     systemPrompt,
     permissionMode,
     onPermissionRequest,
+    onQuestionRequest,
     images,
     onText,
     onBlockEnd,
@@ -258,6 +282,9 @@ export async function claudeQuery(options: QueryOptions): Promise<QueryResult> {
   } = options;
 
   const approveMode = permissionMode === 'approve' && !!onPermissionRequest;
+  const questionMode = !!onQuestionRequest;
+  // Use stdio prompt routing if we need to intercept anything (permissions or questions).
+  const stdioPrompt = approveMode || questionMode;
 
   logger.info("Starting Claude CLI query", {
     cwd,
@@ -266,6 +293,7 @@ export async function claudeQuery(options: QueryOptions): Promise<QueryResult> {
     resume: !!resume,
     hasImages: !!images?.length,
     permissionMode: approveMode ? 'approve' : 'bypass',
+    questionMode,
   });
 
   // Build CLI arguments
@@ -277,11 +305,13 @@ export async function claudeQuery(options: QueryOptions): Promise<QueryResult> {
     '--include-partial-messages',
   ];
 
-  if (approveMode) {
-    // Approve mode: route each permission prompt over stdio so we can ask via WeChat.
+  if (stdioPrompt) {
+    // Route prompts over stdio so we can ask via WeChat. In bypass+question mode
+    // we still auto-allow every non-question tool in the control_request handler,
+    // preserving full-auto behavior while letting AskUserQuestion reach the user.
     args.push('--permission-prompt-tool', 'stdio');
   } else {
-    // Bypass mode: full auto, no prompts.
+    // Bypass mode with no question routing: full auto, no prompts.
     args.push('--dangerously-skip-permissions');
   }
 
@@ -460,9 +490,9 @@ export async function claudeQuery(options: QueryOptions): Promise<QueryResult> {
         logger.warn('Claude CLI stdin write failed', { message });
       }
 
-      // Approve mode keeps stdin open for control_response messages; only end it
-      // in bypass mode where the single user message is all we send.
-      if (approveMode) return;
+      // Stdio-prompt modes (approve / question) keep stdin open for
+      // control_response messages; only end it when we won't send anything more.
+      if (stdioPrompt) return;
 
       safeEndStdin();
     };
@@ -545,11 +575,35 @@ export async function claudeQuery(options: QueryOptions): Promise<QueryResult> {
 
       switch (obj.type) {
         case 'control_request': {
-          // Approve mode: CLI is asking permission for a tool. Ask via callback,
-          // then write the control_response back to stdin. CLI blocks until we reply.
           const req = obj.request;
-          if (approveMode && onPermissionRequest && req?.subtype === 'can_use_tool') {
-            const requestId: string = obj.request_id;
+          if (!req || req.subtype !== 'can_use_tool') break;
+          const requestId: string = obj.request_id;
+
+          const sendResponse = (response: any) => {
+            writeStdin(JSON.stringify({
+              type: 'control_response',
+              response: { subtype: 'success', request_id: requestId, response },
+            }) + '\n');
+          };
+
+          // AskUserQuestion → route to the question callback. The answer is fed
+          // back as a tool result via deny+message (allow/updatedInput do NOT
+          // deliver the answer — verified empirically: yields "user did not answer").
+          if (req.tool_name === 'AskUserQuestion' && onQuestionRequest) {
+            const questions = Array.isArray(req.input?.questions) ? req.input.questions : [];
+            Promise.resolve(onQuestionRequest({ requestId, questions }))
+              .then((answer) => {
+                sendResponse({ behavior: 'deny', message: answer || '用户未作答。' });
+              })
+              .catch((err) => {
+                logger.warn('Question callback failed', { error: err instanceof Error ? err.message : String(err) });
+                sendResponse({ behavior: 'deny', message: '用户未作答。' });
+              });
+            break;
+          }
+
+          // Other tools in approve mode → ask permission via callback.
+          if (approveMode && onPermissionRequest) {
             const permReq: PermissionRequest = {
               requestId,
               toolName: req.tool_name,
@@ -558,21 +612,21 @@ export async function claudeQuery(options: QueryOptions): Promise<QueryResult> {
             };
             Promise.resolve(onPermissionRequest(permReq))
               .then((decision) => {
-                const response = decision.behavior === 'allow'
+                sendResponse(decision.behavior === 'allow'
                   ? { behavior: 'allow', updatedInput: decision.updatedInput ?? req.input }
-                  : { behavior: 'deny', message: decision.message ?? 'User denied this action' };
-                writeStdin(JSON.stringify({
-                  type: 'control_response',
-                  response: { subtype: 'success', request_id: requestId, response },
-                }) + '\n');
+                  : { behavior: 'deny', message: decision.message ?? 'User denied this action' });
               })
               .catch((err) => {
                 logger.warn('Permission callback failed, denying', { error: err instanceof Error ? err.message : String(err) });
-                writeStdin(JSON.stringify({
-                  type: 'control_response',
-                  response: { subtype: 'success', request_id: requestId, response: { behavior: 'deny', message: 'Approval error' } },
-                }) + '\n');
+                sendResponse({ behavior: 'deny', message: 'Approval error' });
               });
+            break;
+          }
+
+          // Bypass + question mode: stdio prompt is on only to catch questions,
+          // so auto-allow every other tool to preserve full-auto behavior.
+          if (questionMode) {
+            sendResponse({ behavior: 'allow', updatedInput: req.input });
           }
           break;
         }
@@ -643,9 +697,9 @@ export async function claudeQuery(options: QueryOptions): Promise<QueryResult> {
             errorMessage = Array.isArray(errors) ? errors.join('; ') : String(errors);
             logger.error('CLI returned error result', { errors });
           }
-          // In approve mode stdin is kept open for control_response; the turn is now
-          // done, so close stdin to let the CLI exit instead of waiting for more input.
-          if (approveMode) {
+          // Stdio-prompt modes keep stdin open for control_response; the turn is
+          // now done, so close stdin to let the CLI exit instead of hanging.
+          if (stdioPrompt) {
             safeEndStdin();
           }
           break;
