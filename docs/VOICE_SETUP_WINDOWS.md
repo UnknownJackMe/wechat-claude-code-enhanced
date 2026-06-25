@@ -65,7 +65,7 @@ python -c "from faster_whisper import WhisperModel; print('faster-whisper OK')"
 
 ### 4. 预下载模型（推荐）
 
-首次运行时 faster-whisper 会自动下载模型，但可能因超时失败。建议提前下载：
+首次运行时 faster-whisper 会自动下载模型，但可能因网络超时失败。建议提前下载：
 
 ```bash
 python -c "
@@ -87,6 +87,35 @@ python -c "from faster_whisper import WhisperModel; WhisperModel('large-v3', dev
 # 设置环境变量（在 daemon 启动前）
 set WCC_FASTER_WHISPER_MODEL=large-v3
 ```
+
+### 5. 网络代理配置（可选）
+
+模型下载需要访问 HuggingFace（huggingface.co）。如果你的网络环境需要代理，在下载模型**之前**设置以下环境变量：
+
+**临时设置（当前终端生效）：**
+
+```powershell
+# PowerShell
+$env:HTTP_PROXY = "http://127.0.0.1:7890"
+$env:HTTPS_PROXY = "http://127.0.0.1:7890"
+```
+
+```cmd
+:: CMD
+set HTTP_PROXY=http://127.0.0.1:7890
+set HTTPS_PROXY=http://127.0.0.1:7890
+```
+
+**永久设置（系统环境变量）：**
+
+```powershell
+[System.Environment]::SetEnvironmentVariable("HTTP_PROXY", "http://127.0.0.1:7890", "User")
+[System.Environment]::SetEnvironmentVariable("HTTPS_PROXY", "http://127.0.0.1:7890", "User")
+```
+
+> 将 `127.0.0.1:7890` 替换为你实际的代理地址和端口（Clash 默认 7890，V2Ray 默认 10809）。
+
+设置好代理后再执行步骤 4 的模型下载命令。下载完成后代理可以关闭，后续转写不需要网络。
 
 ## 验证完整流水线
 

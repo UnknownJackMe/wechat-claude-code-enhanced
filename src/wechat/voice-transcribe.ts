@@ -295,13 +295,15 @@ function getVoiceCdnData(item: MessageItem): { aesKey: string; encryptQueryParam
   return null;
 }
 
-function buildFasterWhisperScript(workDir: string): string {
-  const normalizedDir = workDir.replace(/\\/g, '\\\\');
+function buildFasterWhisperScript(): string {
+  // Script receives work_dir and model via sys.argv to avoid encoding issues
+  // with non-ASCII paths (e.g. Chinese usernames) in inline -c strings.
   return [
-    'import os',
+    'import sys, os',
     'from faster_whisper import WhisperModel',
-    `work_dir = r"${normalizedDir}"`,
-    `model = WhisperModel(${JSON.stringify(FASTER_WHISPER_MODEL)}, device="auto", compute_type="auto")`,
+    'work_dir = sys.argv[1]',
+    'model_name = sys.argv[2]',
+    'model = WhisperModel(model_name, device="auto", compute_type="auto")',
     'segments, _ = model.transcribe(os.path.join(work_dir, "voice.wav"), language="zh")',
     'text = "".join(segment.text for segment in segments).strip()',
     'with open(os.path.join(work_dir, "voice.txt"), "w", encoding="utf-8") as f:',
@@ -323,8 +325,11 @@ async function runWhisperBackend(backend: WhisperBackend, workDir: string, wavPa
     return;
   }
 
-  const script = buildFasterWhisperScript(workDir);
-  await runCommand(backend.command, pythonCommandArgs(backend.command, ['-c', script]), WHISPER_TIMEOUT_MS);
+  // Write script to a file in workDir to avoid cmd.exe encoding issues with
+  // non-ASCII characters in inline -c strings (Chinese usernames, etc.)
+  const scriptPath = join(workDir, 'transcribe.py');
+  writeFileSync(scriptPath, buildFasterWhisperScript(), 'utf-8');
+  await runCommand(backend.command, pythonCommandArgs(backend.command, [scriptPath, workDir, FASTER_WHISPER_MODEL]), WHISPER_TIMEOUT_MS);
 }
 
 /**
