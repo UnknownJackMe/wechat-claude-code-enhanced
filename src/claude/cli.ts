@@ -5,6 +5,20 @@ type ClaudeCommand = {
   shell: boolean;
 };
 
+/**
+ * Escape a single argument for cmd.exe when shell: true.
+ * Wraps in double quotes and escapes internal double quotes and special chars.
+ * This prevents content with dashes, backticks, parentheses, etc. from being
+ * misinterpreted as CLI options or shell metacharacters.
+ */
+function escapeCmdArg(arg: string): string {
+  // If arg is simple (no spaces, no special chars), return as-is
+  if (/^[a-zA-Z0-9_./:=@-]+$/.test(arg)) return arg;
+  // Escape internal double quotes and wrap in double quotes
+  const escaped = arg.replace(/"/g, '\\"');
+  return `"${escaped}"`;
+}
+
 let cachedClaudeCommand: ClaudeCommand | null = null;
 
 function pickWindowsClaudeCandidate(candidates: string[]): string | null {
@@ -63,9 +77,11 @@ export function invalidateClaudeCommandCache(): void {
 
 export function spawnClaude(args: string[], options: SpawnOptions = {}): ChildProcess {
   const resolved = resolveClaudeCommand();
-  return spawn(resolved.command, args, {
+  const useShell = options.shell ?? resolved.shell;
+  const finalArgs = useShell ? args.map(escapeCmdArg) : args;
+  return spawn(resolved.command, finalArgs, {
     ...options,
-    shell: options.shell ?? resolved.shell,
+    shell: useShell,
     windowsHide: options.windowsHide ?? process.platform === 'win32',
   });
 }
@@ -75,9 +91,11 @@ export function spawnClaudeSync(
   options: SpawnSyncOptions = {},
 ): SpawnSyncReturns<string | Buffer> {
   const resolved = resolveClaudeCommand();
-  return spawnSync(resolved.command, args, {
+  const useShell = options.shell ?? resolved.shell;
+  const finalArgs = useShell ? args.map(escapeCmdArg) : args;
+  return spawnSync(resolved.command, finalArgs, {
     ...options,
-    shell: options.shell ?? resolved.shell,
+    shell: useShell,
     windowsHide: options.windowsHide ?? process.platform === 'win32',
   });
 }
