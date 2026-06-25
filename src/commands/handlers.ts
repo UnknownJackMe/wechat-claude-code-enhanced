@@ -104,7 +104,8 @@ const HELP_TEXT = `**📋 可用命令**
 
 ---
 
-💡 直接发文字即可与 Claude Code 对话，也支持发送语音（本地模型转文字）和图片。`;
+💡 直接发文字、语音（本地转文字）、图片、文件即可与 Claude 对话。
+Claude 需要你确认操作（accept 模式）或提选择题时，会自动推送到微信，回复即可。`;
 
 // 缓存 skill 列表，避免每次命令都扫描文件系统
 let cachedSkills: SkillInfo[] | null = null;

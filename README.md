@@ -9,11 +9,44 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-green?style=flat-square" alt="License: MIT"></a>
 </p>
 
-本项目基于 [Wechat-ggGitHub/wechat-claude-code](https://github.com/Wechat-ggGitHub/wechat-claude-code) 的源代码进行增强，在保留原有全部功能的基础上，新增了历史对话恢复、原生上下文压缩、思考强度调节、Advisor 模型、目标驱动循环、定时任务、Workspace 配置文件等功能。
+本项目基于 [Wechat-ggGitHub/wechat-claude-code](https://github.com/Wechat-ggGitHub/wechat-claude-code) 的源代码进行增强。在保留原有全部功能的基础上，新增了历史对话恢复、原生上下文压缩、权限审批转发、选择题转发、模型别名、思考强度调节、Advisor 模型、目标驱动循环、定时任务、Workspace 配置、双向文件互传、语音输入、快捷指令等功能。
+
+人在外面、手边只有手机时，也能用微信指挥本地的 Claude Code 干活。
 
 ---
 
-## 新增功能一览
+## 安装
+
+```bash
+git clone https://github.com/UnknownJackMe/wechat-claude-code-enhanced.git ~/.claude/skills/wechat-claude-code
+cd ~/.claude/skills/wechat-claude-code && npm install
+```
+
+首次扫码绑定与 daemon 管理：
+
+```bash
+npm run setup                # 首次扫码绑定微信
+npm run daemon -- start      # 启动守护进程（开机自启，崩溃自动重启）
+npm run daemon -- status     # 查看运行状态
+npm run daemon -- restart    # 重启（更新代码后用）
+npm run daemon -- logs       # 查看日志
+```
+
+### 可选：语音输入依赖（macOS）
+
+如果想直接在微信发语音让 Claude 听懂，需要本地转录工具链：
+
+```bash
+pip install pilk          # 微信 SILK 语音编解码
+brew install ffmpeg       # 音频封装
+pip install mlx-whisper   # Apple Silicon 上的本地 whisper
+```
+
+不装也不影响文字/图片/文件功能，只是发语音时无法转录。
+
+---
+
+## 命令使用方法
 
 ### `/resume` — 历史对话恢复
 
@@ -82,11 +115,11 @@
 
 ---
 
-### `/model-config` — 模型别名管理
+### `/model` 与 `/model-config` — 模型切换与别名
 
-每次切换模型都要输入完整的 model ID 很麻烦，`/model-config` 让你绑定一个短别名。
+`/model <名称>` 切换模型，切换前会用一个极短的探测请求**实际验证模型可用性**再提交。验证失败会告诉你具体原因——模型名无效、认证/欠费、网络不可达、限流等——并保持原模型不变。这避免了输入无效模型导致守护进程静默卡死。
 
-切换模型时（无论是 `/model` 还是别名）会先用一个极短的探测请求**实际验证模型可用性**，再提交切换。验证失败会告诉你具体原因——模型名无效、认证/欠费、网络不可达、限流等——并保持原模型不变。这避免了输入无效模型导致守护进程静默卡死。
+每次输入完整 model ID 很麻烦，`/model-config` 让你绑定短别名：
 
 ```
 /model-config                                          — 列出所有别名
@@ -95,14 +128,14 @@
 /model-config sonnet                                   — 查看单个别名
 ```
 
-配置好别名后，直接用 `/model sonnet` 切换即可，无需输入完整 ID。切换时会显示别名展开结果：
+配置好后直接 `/model sonnet` 即可，切换时显示别名展开结果：
 
 ```
 ✅ 模型已切换为: claude-sonnet-4-6-thinking[1m]
 （别名 "sonnet" → claude-sonnet-4-6-thinking[1m]）
 ```
 
-别名数据持久化存储在 `~/.wechat-claude-code/model-aliases.json`，daemon 重启后保留。
+别名持久化存储在 `~/.wechat-claude-code/model-aliases.json`，daemon 重启后保留。
 
 ---
 
@@ -148,7 +181,7 @@
 
 ---
 
-### Workspace 配置文件
+### Workspace 配置（`/configs` 等）
 
 针对多项目场景，一键切换目录、模型、思考强度和历史对话。
 
@@ -157,11 +190,7 @@
 - `/switch-config 0` — 一键切换
 - `/delete-config 0` — 删除配置
 
----
-
-### `/status` 增强
-
-显示当前是否处于某个 workspace 配置中，所有字段分行清晰展示。
+`/status` 会显示当前是否处于某个 workspace 配置中，所有字段分行清晰展示。
 
 ---
 
@@ -197,15 +226,9 @@
 
 技术实现：微信语音是腾讯 SILK v3 格式（ffmpeg 不支持），处理链路为
 `下载解密 → pilk 解码成 PCM → ffmpeg 封装 wav → mlx_whisper 转录`。
-转录模型用 `mlx-community/whisper-large-v3-mlx`（Apple Silicon 原生加速，中英文俱佳）。
+转录模型用 `mlx-community/whisper-large-v3-mlx`（Apple Silicon 原生加速，中英文俱佳）。所有外部程序均通过绝对路径探测，兼容 launchd 守护进程与终端 PATH 不一致的情况。
 
-依赖（macOS）：
-```bash
-pip install pilk          # SILK 编解码
-brew install ffmpeg       # 音频封装
-pip install mlx-whisper   # Apple Silicon 上的 whisper
-```
-所有外部程序均通过绝对路径探测，兼容 launchd 守护进程与终端 PATH 不一致的情况。
+依赖安装见上文「安装 → 可选：语音输入依赖」。
 
 ---
 
@@ -224,80 +247,6 @@ pip install mlx-whisper   # Apple Silicon 上的 whisper
 
 ---
 
-## 安装
-
-```bash
-git clone https://github.com/UnknownJackMe/wechat-claude-code-enhanced.git ~/.claude/skills/wechat-claude-code
-cd ~/.claude/skills/wechat-claude-code && npm install
-```
-
-首次扫码绑定及 daemon 管理，参考原项目文档：
-
-```bash
-npm run setup                # 首次扫码绑定
-npm run daemon -- start      # 启动守护进程（开机自启，崩溃自动重启）
-npm run daemon -- status     # 查看运行状态
-npm run daemon -- logs       # 查看日志
-```
-
-## 完整命令列表
-
-```
-━━━ 会话管理 ━━━
-/help               显示帮助
-/status             查看当前会话状态
-/clear              清除当前会话
-/reset              完全重置
-/stop               停止当前对话
-/compact            压缩上下文（保持 session ID）
-/history [数量]     查看对话记录
-/undo [数量]        撤销最近对话
-
-━━━ 对话恢复 ━━━
-/resume             列出当前目录的历史对话
-/resume <编号>      恢复指定编号的历史对话
-/resume <uuid>      通过 session ID 恢复
-
-━━━ 模型配置 ━━━
-/model [别名/名称]  查看或切换模型
-/model-config       列出所有模型别名
-/model-config <别名> <完整ID>  添加/更新别名
-/model-config del <别名>       删除别名
-/mode [bypass|accept] 权限模式：全自动 / 逐个 y/n 确认
-/effort [级别]      查看或调整思考强度（low/medium/high/xhigh/max）
-/advisor [模型]     查看或设置 Advisor 模型（opus/sonnet/fable/off）
-
-━━━ 任务控制 ━━━
-/q                  列出所有快捷指令
-/q <名字>           执行快捷指令
-/q set <名字> <内容> 添加/更新快捷指令
-/q del <名字>        删除快捷指令
-/goal [条件]        设置目标，Claude 持续工作直到条件满足
-/goal clear         清除当前目标
-/loop <间隔> <提示> 定时循环执行，例: /loop 5m 检查 CI
-/loop               列出所有运行中的 loop
-/loop stop <id>     停止指定 loop
-/loop stop all      停止所有 loop
-
-━━━ Workspace 配置 ━━━
-/configs                  列出所有 workspace 配置
-/set-config <编号>        向导式创建/编辑配置
-/switch-config <编号>     一键切换（目录+模型+session）
-/delete-config <编号>     删除配置
-
-━━━ 其他 ━━━
-/cwd [路径]         查看或切换工作目录
-/prompt [内容]      查看或设置系统提示词
-/send-me <路径>     发送本地文件给你（支持多路径、目录）
-/send-you           开始接收你发来的文件/图片
-/send-you-end [要求] 结束接收，将文件+图片连同要求发给 Claude
-/send-you-cancel    取消文件接收
-/skills [full]      列出已安装的 skill
-/version            查看版本信息
-```
-
-直接发送语音消息会用本地模型（mlx_whisper）转成文字再交给 Claude。
-
 ## 交流社群
 
 如果有任何问题、使用反馈，或者想和大家一起交流，欢迎扫码加我微信进群。
@@ -315,3 +264,63 @@ npm run daemon -- logs       # 查看日志
 ## License
 
 MIT
+
+```
+━━━ 会话管理 ━━━
+/help               显示帮助
+/status             查看当前会话状态
+/clear              清除当前会话（保留目录/模型设置）
+/reset              完全重置（恢复所有默认设置）
+/stop               停止当前对话并清空排队消息
+/compact            压缩上下文（保持 session ID）
+/history [数量]     查看对话记录（默认 20 条）
+/undo [数量]        撤销最近对话（默认 1 条）
+
+━━━ 对话恢复 ━━━
+/resume             列出当前目录的历史对话
+/resume <编号>      恢复指定编号的历史对话
+/resume <uuid>      通过 session ID 恢复
+
+━━━ 模型与权限 ━━━
+/model [别名/名称]  查看或切换模型（切换前自动验证可用性）
+/model-config       列出所有模型别名
+/model-config <别名> <完整ID>  添加/更新别名
+/model-config del <别名>       删除别名
+/mode [bypass|accept] 权限模式：全自动 / 逐个 y/n 确认
+/effort [级别]      思考强度（low/medium/high/xhigh/max）
+/advisor [模型]     Advisor 模型（opus/sonnet/fable/off）
+
+━━━ 任务控制 ━━━
+/q                  列出所有快捷指令
+/q <名字>           执行快捷指令
+/q set <名字> <内容> 添加/更新快捷指令
+/q del <名字>        删除快捷指令
+/goal [条件]        设置目标，Claude 持续工作直到完成
+/goal clear         清除当前目标
+/loop <间隔> <提示> 定时循环，例: /loop 5m 检查 CI
+/loop               列出所有运行中的 loop
+/loop stop <id>     停止指定 loop
+/loop stop all      停止所有 loop
+
+━━━ Workspace 配置 ━━━
+/configs                  列出所有 workspace 配置
+/set-config <编号>        向导式创建/编辑配置
+/switch-config <编号>     一键切换（目录+模型+session）
+/delete-config <编号>     删除配置
+
+━━━ 文件与工具 ━━━
+/cwd [路径]         查看或切换工作目录
+/prompt [内容]      查看或设置系统提示词
+/send-me <路径>     发送本地文件给你（支持多路径、目录）
+/send-you           开始接收你发来的文件/图片
+/send-you-end [要求] 结束接收，将文件+图片发给 Claude
+/send-you-cancel    取消文件接收
+/skills [full]      列出已安装的 skill
+/version            查看版本信息
+```
+
+此外，**直接发文字/语音/图片/文件**即可与 Claude Code 对话；Claude 提出的选择题和需要确认的操作也会自动推送到微信（见下文）。
+
+---
+
+## 命令使用方法
