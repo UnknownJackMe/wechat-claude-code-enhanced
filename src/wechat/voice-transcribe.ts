@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync, statSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync, statSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir, tmpdir } from 'node:os';
 import type { MessageItem } from './types.js';
@@ -7,7 +7,7 @@ import { downloadAndDecrypt } from './cdn.js';
 import { logger } from '../logger.js';
 
 const MLX_WHISPER_MODEL = 'mlx-community/whisper-large-v3-mlx';
-const FASTER_WHISPER_MODEL = process.env.WCC_FASTER_WHISPER_MODEL || 'large-v3';
+const FASTER_WHISPER_MODEL = process.env.WCC_FASTER_WHISPER_MODEL || 'small';
 const SILK_TIMEOUT_MS = 30_000;
 const FFMPEG_TIMEOUT_MS = 30_000;
 const WHISPER_TIMEOUT_MS = 180_000;
@@ -16,6 +16,8 @@ const MAX_VOICE_DOWNLOAD_SIZE = 25 * 1024 * 1024;
 const MAX_TRANSCRIPT_BYTES = 64 * 1024;
 const MAX_TRANSCRIPT_CHARS = 4000;
 const MAX_STDERR_CHARS = 4000;
+
+type SilkBackend = 'pilk' | 'pysilk';
 
 type WhisperBackend =
   | { kind: 'mlx'; command: string }
@@ -56,6 +58,8 @@ function resolveBinary(candidates: string[], checkArgs: string[]): string | null
 }
 
 let pythonCache: BinaryProbeCache = { value: undefined, checkedAt: 0 };
+let silkBackend: SilkBackend = 'pilk';
+
 function findPython(): string | null {
   if (pythonCache.value) return pythonCache.value;
   if (isFreshMiss(pythonCache)) return null;
@@ -63,10 +67,15 @@ function findPython(): string | null {
   const windowsPythonCandidates = process.platform === 'win32'
     ? [
         ...expandWindowsPythonRoots([
+          join(process.env.LOCALAPPDATA ?? '', 'Programs', 'Python', 'Python314'),
           join(process.env.LOCALAPPDATA ?? '', 'Programs', 'Python', 'Python313'),
           join(process.env.LOCALAPPDATA ?? '', 'Programs', 'Python', 'Python312'),
           join(process.env.LOCALAPPDATA ?? '', 'Programs', 'Python', 'Python311'),
           join(process.env.LOCALAPPDATA ?? '', 'Programs', 'Python', 'Python310'),
+          'C:\\Python314',
+          'C:\\Python313',
+          'C:\\Python312',
+          'C:\\Python311',
           join(homedir(), 'miniforge3'),
           join(homedir(), 'miniconda3'),
           join(homedir(), 'anaconda3'),
@@ -89,24 +98,33 @@ function findPython(): string | null {
     'python',
   ];
 
-  for (const py of candidates) {
-    try {
-      const args = py === 'py' ? ['-3', '-c', 'import pilk'] : ['-c', 'import pilk'];
-      const r = spawnSync(py, args, {
-        stdio: 'ignore',
-        windowsHide: process.platform === 'win32',
-      });
-      if (r.status === 0) {
-        pythonCache = { value: py, checkedAt: Date.now() };
-        logger.info('Found python with pilk', { python: py });
-        return py;
+  // Try pilk first, then pysilk as fallback
+  const silkModules: { module: string; backend: SilkBackend }[] = [
+    { module: 'pilk', backend: 'pilk' },
+    { module: 'pysilk', backend: 'pysilk' },
+  ];
+
+  for (const { module, backend } of silkModules) {
+    for (const py of candidates) {
+      try {
+        const args = py === 'py' ? ['-3', '-c', `import ${module}`] : ['-c', `import ${module}`];
+        const r = spawnSync(py, args, {
+          stdio: 'ignore',
+          windowsHide: process.platform === 'win32',
+        });
+        if (r.status === 0) {
+          pythonCache = { value: py, checkedAt: Date.now() };
+          silkBackend = backend;
+          logger.info('Found python with SILK decoder', { python: py, silkBackend: backend });
+          return py;
+        }
+      } catch {
+        // Try next candidate.
       }
-    } catch {
-      // Try next candidate.
     }
   }
 
-  logger.warn('No python with pilk found — voice transcription unavailable');
+  logger.warn('No python with pilk/pysilk found — voice transcription unavailable');
   pythonCache = { value: null, checkedAt: Date.now() };
   return null;
 }
@@ -166,14 +184,32 @@ function findFfmpeg(): string | null {
   if (ffmpegCache.value) return ffmpegCache.value;
   if (isFreshMiss(ffmpegCache)) return null;
 
-  const windowsCandidates = process.platform === 'win32'
-    ? [
-        join('C:\\ffmpeg', 'bin', 'ffmpeg.exe'),
-        join(homedir(), 'scoop', 'shims', 'ffmpeg.exe'),
-        join(process.env.LOCALAPPDATA ?? '', 'Microsoft', 'WinGet', 'Links', 'ffmpeg.exe'),
-        'ffmpeg.exe',
-      ]
-    : [];
+  const windowsCandidates: string[] = [];
+  if (process.platform === 'win32') {
+    windowsCandidates.push(
+      join('C:\\ffmpeg', 'bin', 'ffmpeg.exe'),
+      join(homedir(), 'scoop', 'shims', 'ffmpeg.exe'),
+      join(process.env.LOCALAPPDATA ?? '', 'Microsoft', 'WinGet', 'Links', 'ffmpeg.exe'),
+    );
+    // Scan WinGet Packages for ffmpeg installs (Gyan.FFmpeg etc.)
+    const wingetPkgs = join(process.env.LOCALAPPDATA ?? '', 'Microsoft', 'WinGet', 'Packages');
+    try {
+      const entries = readdirSync(wingetPkgs);
+      for (const entry of entries) {
+        if (/ffmpeg/i.test(entry)) {
+          const pkgDir = join(wingetPkgs, entry);
+          try {
+            const subEntries = readdirSync(pkgDir);
+            for (const sub of subEntries) {
+              const candidate = join(pkgDir, sub, 'bin', 'ffmpeg.exe');
+              if (existsSync(candidate)) windowsCandidates.push(candidate);
+            }
+          } catch { /* skip */ }
+        }
+      }
+    } catch { /* WinGet dir may not exist */ }
+    windowsCandidates.push('ffmpeg.exe');
+  }
 
   const ffmpeg = resolveBinary([
     ...windowsCandidates,
@@ -320,7 +356,9 @@ export async function transcribeVoice(item: MessageItem): Promise<string | null>
 
     await runCommand(python, pythonCommandArgs(python, [
       '-c',
-      'import sys,pilk; pilk.decode(sys.argv[1], sys.argv[2], pcm_rate=16000)',
+      silkBackend === 'pilk'
+        ? 'import sys,pilk; pilk.decode(sys.argv[1], sys.argv[2], pcm_rate=16000)'
+        : 'import sys,pysilk; pysilk.decode(open(sys.argv[1],"rb"), open(sys.argv[2],"wb"), sample_rate=16000)',
       silkPath, pcmPath,
     ]), SILK_TIMEOUT_MS);
 
