@@ -63,12 +63,14 @@ ffmpeg -version
 
 如果想直接在微信发语音让 Claude 听懂，需要本地转录工具链：
 
-- `pilk`：微信 SILK 语音编解码
+- `pilk` / `pysilk`：微信 SILK 语音编解码
 - `ffmpeg`：音频封装
 - `mlx-whisper`：macOS Apple Silicon 默认后端
 - `faster-whisper`：Windows / Linux 默认后端
 
-不装也不影响文字/图片/文件功能，只是发语音时会降级为“无法识别，请重发或直接打字”。
+不装也不影响文字/图片/文件功能，只是发语音时会降级为”无法识别，请重发或直接打字”。
+
+> **Windows 用户**：语音识别的详细安装步骤请参考 [Windows 语音识别模块安装指南](docs/VOICE_SETUP_WINDOWS.md)。
 
 ---
 
