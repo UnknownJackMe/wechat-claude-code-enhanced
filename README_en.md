@@ -27,6 +27,27 @@ Scan a QR code to bind your WeChat, and a new "friend" appears in your contacts.
 
 ---
 
+## Prerequisites
+
+> ⚠️ **This project is a WeChat bridge for Claude Code CLI — it is NOT a plugin for Claude Desktop.**
+
+**1. Node.js 18+**
+
+```bash
+node --version   # Must be v18.0.0 or higher
+```
+
+**2. Claude Code CLI**
+
+```bash
+npm install -g @anthropic-ai/claude-code
+claude --version
+```
+
+If you only have Claude Desktop (the GUI app) installed, this project will not work. You need the command-line version of Claude Code.
+
+---
+
 ## Install
 
 **Option 1: skills CLI (recommended)**

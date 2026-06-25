@@ -15,6 +15,27 @@
 
 ---
 
+## 前提条件
+
+> ⚠️ **本项目是 Claude Code CLI 的微信桥接工具，不是 Claude Desktop 的插件。**
+
+**1. Node.js 18+**
+
+```bash
+node --version   # 需要 v18.0.0 或更高
+```
+
+**2. Claude Code CLI**
+
+```bash
+npm install -g @anthropic-ai/claude-code
+claude --version
+```
+
+如果你只安装了 Claude Desktop（桌面客户端），本项目无法工作。需要的是命令行版本的 Claude Code。
+
+---
+
 ## 安装
 
 macOS / Linux:
