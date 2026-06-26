@@ -71,58 +71,84 @@ export async function validateModel(model: string, cwd: string): Promise<ModelVa
     let pendingTimeoutResult: ModelValidationResult | undefined;
 
     const cleanup = () => {
-      if (timer) {
-        clearTimeout(timer);
-        timer = undefined;
-      }
-      if (killFallbackTimer) {
-        clearTimeout(killFallbackTimer);
-        killFallbackTimer = undefined;
-      }
+      if (timer) { clearTimeout(timer); timer = undefined; }
+      if (killFallbackTimer) { clearTimeout(killFallbackTimer); killFallbackTimer = undefined; }
     };
 
     const finish = (r: ModelValidationResult) => {
       if (settled) return;
       settled = true;
       cleanup();
+      // Kill the probe process — we don't need its full output.
+      try { child?.kill('SIGKILL'); } catch { /* ignore */ }
       resolve(r);
     };
 
     try {
+      // Use stream-json so we can declare success the moment the session is
+      // initialised (system/init event). With --output-format json, thinking
+      // models (claude-*-thinking[1m]) silently think for 30-60 s before
+      // writing any output, making them indistinguishable from invalid models
+      // within a short timeout window.
       child = spawn('claude', [
         '-p', 'reply with just: ok',
         '--model', model,
-        '--output-format', 'json',
+        '--output-format', 'stream-json',
         '--dangerously-skip-permissions',
-      ], { cwd, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env } });
+      ], { cwd, stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env } });
     } catch (err) {
       finish({ ok: false, reason: 'unknown', detail: err instanceof Error ? err.message : String(err) });
       return;
     }
 
-    // Invalid model hangs with no output — timeout is how we catch it.
+    // Close stdin immediately — we only need the init handshake.
+    try { child.stdin?.end(); } catch { /* ignore */ }
+
+    // Timeout: invalid models hang with no output at all.
     timer = setTimeout(() => {
       pendingTimeoutResult = {
         ok: false,
         reason: 'timeout',
         detail: '探测超时（无响应），通常是模型名无效或服务无法访问',
       };
-      try {
-        child?.kill('SIGKILL');
-      } catch {
-        // Fall through to the fallback resolver below.
-      }
-      killFallbackTimer = setTimeout(() => {
-        finish(pendingTimeoutResult!);
-      }, FORCE_KILL_AFTER_MS);
+      try { child?.kill('SIGKILL'); } catch { /* ignore */ }
+      killFallbackTimer = setTimeout(() => finish(pendingTimeoutResult!), FORCE_KILL_AFTER_MS);
     }, MODEL_PROBE_TIMEOUT_MS);
 
-    const out: string[] = [];
     const errOut: string[] = [];
-    child.stdout?.setEncoding('utf8');
-    child.stdout?.on('data', (c: string) => out.push(c));
     child.stderr?.setEncoding('utf8');
     child.stderr?.on('data', (c: string) => errOut.push(c));
+
+    // Parse NDJSON from stdout — succeed on the very first system/init event
+    // so we don't have to wait for the full thinking turn to complete.
+    const rl = createInterface({ input: child.stdout! });
+    rl.on('line', (line: string) => {
+      if (settled || !line.trim()) return;
+      let obj: any;
+      try { obj = JSON.parse(line); } catch { return; }
+
+      if (obj.type === 'system' && obj.subtype === 'init') {
+        // Model is valid and the session started successfully.
+        finish({ ok: true });
+        return;
+      }
+
+      if (obj.type === 'result') {
+        // If we somehow get a result event before init (shouldn't happen),
+        // treat success/error appropriately.
+        if (obj.subtype === 'error' || obj.is_error) {
+          const blob = `${obj.result ?? ''} ${obj.error_message ?? ''} ${errOut.join('')}`.toLowerCase();
+          let reason: ModelValidationResult['reason'] = 'unknown';
+          if (/model|not found|unknown model|does not exist|invalid model/.test(blob)) reason = 'invalid_model';
+          else if (/auth|api key|unauthor|401|403|forbidden|credit|billing/.test(blob)) reason = 'auth';
+          else if (/network|timeout|econn|enotfound|getaddrinfo|fetch failed|socket/.test(blob)) reason = 'network';
+          else if (/rate|429|overloaded|529/.test(blob)) reason = 'rate_limit';
+          finish({ ok: false, reason, detail: (obj.result || obj.error_message || '').slice(0, 200) });
+        } else {
+          finish({ ok: true });
+        }
+      }
+    });
 
     child.on('error', (err) => {
       finish({ ok: false, reason: 'unknown', detail: err.message });
@@ -130,33 +156,19 @@ export async function validateModel(model: string, cwd: string): Promise<ModelVa
 
     child.on('close', () => {
       if (settled) return;
-      if (pendingTimeoutResult) {
-        finish(pendingTimeoutResult);
-        return;
-      }
-
-      const stdout = out.join('').trim();
+      if (pendingTimeoutResult) { finish(pendingTimeoutResult); return; }
       const stderr = errOut.join('').trim();
-      let parsed: any;
-      try { parsed = JSON.parse(stdout); } catch { /* not json */ }
-
-      if (parsed && parsed.is_error === false && parsed.subtype === 'success') {
-        finish({ ok: true });
-        return;
-      }
-
-      // Classify from whatever error text we have.
-      const blob = `${parsed?.result ?? ''} ${parsed?.api_error_status ?? ''} ${stderr}`.toLowerCase();
+      const blob = stderr.toLowerCase();
       let reason: ModelValidationResult['reason'] = 'unknown';
       if (/model|not found|unknown model|does not exist|invalid model/.test(blob)) reason = 'invalid_model';
       else if (/auth|api key|unauthor|401|403|forbidden|credit|billing/.test(blob)) reason = 'auth';
       else if (/network|timeout|econn|enotfound|getaddrinfo|fetch failed|socket/.test(blob)) reason = 'network';
       else if (/rate|429|overloaded|529/.test(blob)) reason = 'rate_limit';
-      const detail = (parsed?.result || parsed?.api_error_status || stderr || '').slice(0, 200);
-      finish({ ok: false, reason, detail });
+      finish({ ok: false, reason, detail: stderr.slice(0, 200) });
     });
   });
 }
+
 
 // ---------------------------------------------------------------------------
 // Public types
