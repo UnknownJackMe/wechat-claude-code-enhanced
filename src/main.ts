@@ -604,39 +604,48 @@ async function runDaemon(): Promise<void> {
     const delay = Math.max(0, loop.nextFireAt - Date.now());
     const timer = setTimeout(async () => {
       loopTimers.delete(loop.id);
-      // Check loop still exists (may have been stopped)
-      const current = loadLoops().find(l => l.id === loop.id);
-      if (!current) return;
+      try {
+        // Check loop still exists (may have been stopped)
+        const current = loadLoops().find(l => l.id === loop.id);
+        if (!current) return;
 
-      logger.info('Loop firing', { id: loop.id, prompt: loop.prompt.slice(0, 60) });
-      const loopFromUserId = account!.userId || '';
-      const loopContextToken = sharedCtx.lastContextToken;
-      if (!loopFromUserId || !loopContextToken) {
-        logger.warn('Loop skipped: no user to send to', { id: loop.id });
-      } else {
+        logger.info('Loop firing', { id: loop.id, prompt: loop.prompt.slice(0, 60) });
+        const loopFromUserId = account!.userId || '';
+        const loopContextToken = sharedCtx.lastContextToken;
+        if (!loopFromUserId || !loopContextToken) {
+          logger.warn('Loop skipped: no user to send to', { id: loop.id });
+        } else {
+          try {
+            await sendToClaude(
+              `[🔁 定时任务] ${loop.prompt}`,
+              undefined, undefined,
+              loopFromUserId, loopContextToken,
+              account!, session, sessionStore, sender, config, activeControllers,
+            );
+          } catch (err) {
+            logger.error('Loop execution failed', { id: loop.id, error: err instanceof Error ? err.message : String(err) });
+          }
+        }
+      } catch (err) {
+        // Any unexpected error in the timer body (e.g. loadLoops throwing) must
+        // not break the timer chain — log and still reschedule below.
+        logger.error('Loop timer body failed', { id: loop.id, error: err instanceof Error ? err.message : String(err) });
+      } finally {
+        // Reschedule regardless of success/failure, as long as the loop still exists.
         try {
-          await sendToClaude(
-            `[🔁 定时任务] ${loop.prompt}`,
-            undefined, undefined,
-            loopFromUserId, loopContextToken,
-            account!, session, sessionStore, sender, config, activeControllers,
-          );
+          const latest = loadLoops().find(l => l.id === loop.id);
+          if (!latest) {
+            logger.info('Loop removed during execution, skipping reschedule', { id: loop.id });
+            clearLoopTimer(loop.id);
+          } else {
+            const nextFireAt = Date.now() + latest.intervalMs;
+            updateNextFire(loop.id, nextFireAt);
+            scheduleLoop({ ...latest, nextFireAt });
+          }
         } catch (err) {
-          logger.error('Loop execution failed', { id: loop.id, error: err instanceof Error ? err.message : String(err) });
+          logger.error('Loop reschedule failed', { id: loop.id, error: err instanceof Error ? err.message : String(err) });
         }
       }
-
-      const latest = loadLoops().find(l => l.id === loop.id);
-      if (!latest) {
-        logger.info('Loop removed during execution, skipping reschedule', { id: loop.id });
-        clearLoopTimer(loop.id);
-        return;
-      }
-
-      // Reschedule
-      const nextFireAt = Date.now() + latest.intervalMs;
-      updateNextFire(loop.id, nextFireAt);
-      scheduleLoop({ ...latest, nextFireAt });
     }, delay);
     loopTimers.set(loop.id, timer);
   }
@@ -663,6 +672,23 @@ async function runDaemon(): Promise<void> {
 
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
+
+  // Last-resort safety net: keep the daemon alive when a single message's
+  // exception slips past the per-message try/catch in drainQueue or escapes a
+  // fire-and-forget promise. Log fully (message + stack) but do NOT exit —
+  // one bad message must not take down the whole process.
+  process.on('uncaughtException', (err) => {
+    logger.error('Uncaught exception (daemon kept alive)', {
+      error: err instanceof Error ? err.message : String(err),
+      stack: err instanceof Error ? err.stack : undefined,
+    });
+  });
+  process.on('unhandledRejection', (reason) => {
+    logger.error('Unhandled rejection (daemon kept alive)', {
+      error: reason instanceof Error ? reason.message : String(reason),
+      stack: reason instanceof Error ? reason.stack : undefined,
+    });
+  });
 
   logger.info('Daemon started', { accountId: account.accountId });
   console.log(`已启动 (账号: ${account.accountId})`);
@@ -1219,9 +1245,11 @@ async function sendToClaude(
         ? (req) => new Promise<{ behavior: 'allow' | 'deny'; message?: string }>((resolveDecision) => {
             // Park the resolver; the user's y/n reply (priority command) resolves it.
             const timer = setTimeout(() => {
-              if (pendingApprovals.get(account.accountId)?.resolve === resolveDecision) {
-                pendingApprovals.delete(account.accountId);
-              }
+              // First-to-win: only fire if this pending is still ours (the user
+              // hasn't already replied and resolved/removed it). clearTimeout can't
+              // stop a callback that has already entered the queue, so re-check.
+              if (pendingApprovals.get(account.accountId)?.resolve !== resolveDecision) return;
+              pendingApprovals.delete(account.accountId);
               sender.sendText(fromUserId, contextToken, '⏱ 30 秒未确认，已自动拒绝此操作。').catch(() => {});
               resolveDecision({ behavior: 'deny', message: '审批超时' });
             }, APPROVAL_TIMEOUT_MS);
@@ -1239,9 +1267,11 @@ async function sendToClaude(
       // Active in any permission mode (the provider turns on stdio prompt for it).
       onQuestionRequest: (req) => new Promise<string>((resolveAnswer) => {
         const timer = setTimeout(() => {
-          if (pendingQuestions.get(account.accountId)?.resolve === resolveAnswer) {
-            pendingQuestions.delete(account.accountId);
-          }
+          // First-to-win: only fire if this pending is still ours (the user
+          // hasn't already replied and resolved/removed it). clearTimeout can't
+          // stop a callback that has already entered the queue, so re-check.
+          if (pendingQuestions.get(account.accountId)?.resolve !== resolveAnswer) return;
+          pendingQuestions.delete(account.accountId);
           sender.sendText(fromUserId, contextToken, '⏱ 5 分钟未选择，已跳过。Claude 将自行继续。').catch(() => {});
           resolveAnswer('用户未在限时内作答。');
         }, QUESTION_TIMEOUT_MS);
@@ -1257,24 +1287,38 @@ async function sendToClaude(
         sender.sendText(fromUserId, contextToken, formatQuestionRequest(req.questions)).catch(() => {});
       }),
       onText: async (delta: string) => {
-        textBuffer += delta;
+        try {
+          textBuffer += delta;
 
-        const bufferBig = textBuffer.length > SOFT_FLUSH_LIMIT;
-        const bufferReadable = endsWithStructuralBoundary(textBuffer) && textBuffer.trim().length >= MIN_BATCH_FLUSH_LEN;
-        const intervalOk = Date.now() - lastSentTime >= MIN_FLUSH_INTERVAL_MS;
+          const bufferBig = textBuffer.length > SOFT_FLUSH_LIMIT;
+          const bufferReadable = endsWithStructuralBoundary(textBuffer) && textBuffer.trim().length >= MIN_BATCH_FLUSH_LEN;
+          const intervalOk = Date.now() - lastSentTime >= MIN_FLUSH_INTERVAL_MS;
 
-        // Flush only when content is substantial AND enough time has passed,
-        // OR when buffer is about to exceed the message size limit.
-        if (bufferBig || (bufferReadable && intervalOk)) {
-          await flushText();
+          // Flush only when content is substantial AND enough time has passed,
+          // OR when buffer is about to exceed the message size limit.
+          if (bufferBig || (bufferReadable && intervalOk)) {
+            await flushText();
+          }
+        } catch (err) {
+          // Provider invokes this fire-and-forget and silently swallows errors,
+          // so log here for diagnosis. Do not re-throw — that would break the stream.
+          logger.warn('onText callback failed', { error: err instanceof Error ? err.message : String(err) });
         }
       },
       onBlockEnd: () => {
-        const bufferBig = textBuffer.length > SOFT_FLUSH_LIMIT;
-        const bufferReadable = textBuffer.trim().length >= MIN_BATCH_FLUSH_LEN;
-        const intervalOk = Date.now() - lastSentTime >= MIN_FLUSH_INTERVAL_MS;
-        if (bufferBig || (bufferReadable && intervalOk)) {
-          flushText();
+        try {
+          const bufferBig = textBuffer.length > SOFT_FLUSH_LIMIT;
+          const bufferReadable = textBuffer.trim().length >= MIN_BATCH_FLUSH_LEN;
+          const intervalOk = Date.now() - lastSentTime >= MIN_FLUSH_INTERVAL_MS;
+          if (bufferBig || (bufferReadable && intervalOk)) {
+            // Fire-and-forget by design (don't block the stream), but flushText()
+            // reassigns flushChain synchronously, so this task is appended to the
+            // serial chain before this callback returns. The final `await flushText()`
+            // after the query awaits the chain tail, so this flush is not orphaned.
+            flushText();
+          }
+        } catch (err) {
+          logger.warn('onBlockEnd callback failed', { error: err instanceof Error ? err.message : String(err) });
         }
       },
     };

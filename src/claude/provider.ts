@@ -69,10 +69,16 @@ export async function validateModel(model: string, cwd: string): Promise<ModelVa
     let timer: NodeJS.Timeout | undefined;
     let killFallbackTimer: NodeJS.Timeout | undefined;
     let pendingTimeoutResult: ModelValidationResult | undefined;
+    // Fix for issue 4: hold a reference to the readline interface so cleanup() can
+    // close it. createInterface(child.stdout) keeps the stream attached; never
+    // closing it leaks an fd/handle every probe in a long-running daemon.
+    let rl: ReturnType<typeof createInterface> | undefined;
 
     const cleanup = () => {
       if (timer) { clearTimeout(timer); timer = undefined; }
       if (killFallbackTimer) { clearTimeout(killFallbackTimer); killFallbackTimer = undefined; }
+      // Fix for issue 4: release the readline interface on every settle path.
+      if (rl) { try { rl.close(); } catch { /* ignore */ } rl = undefined; }
     };
 
     const finish = (r: ModelValidationResult) => {
@@ -121,7 +127,7 @@ export async function validateModel(model: string, cwd: string): Promise<ModelVa
 
     // Parse NDJSON from stdout — succeed on the very first system/init event
     // so we don't have to wait for the full thinking turn to complete.
-    const rl = createInterface({ input: child.stdout! });
+    rl = createInterface({ input: child.stdout! });
     rl.on('line', (line: string) => {
       if (settled || !line.trim()) return;
       let obj: any;
@@ -248,6 +254,14 @@ export interface QueryResult {
 const TEMP_DIR = join(tmpdir(), 'wechat-claude-code');
 const QUERY_TIMEOUT_MS = 60 * 60 * 1000;
 const FORCE_KILL_AFTER_MS = 5 * 1000;
+// Fix for issue 3: defensive fallback timeout for an outstanding control_request
+// (AskUserQuestion / permission prompt). If the upper-layer callback never settles
+// (e.g. WeChat side hangs without its own timeout firing), the Claude CLI would
+// block forever waiting for a control_response. This is a *backstop* only: main.ts
+// already enforces APPROVAL_TIMEOUT_MS (30s) and QUESTION_TIMEOUT_MS (5min), so this
+// value is set deliberately ABOVE those (6 min) to avoid pre-empting them under
+// normal operation — it should only fire if those upper-layer timeouts malfunction.
+const CONTROL_REQUEST_TIMEOUT_MS = 6 * 60 * 1000;
 const MAX_TEXT_BYTES = 2 * 1024 * 1024;
 const RETAIN_TEXT_BYTES = 500 * 1024;
 
@@ -364,6 +378,13 @@ export async function claudeQuery(options: QueryOptions): Promise<QueryResult> {
     let abortListenerRegistered = false;
     let stdoutClosed = false;
     let stderrClosed = false;
+    // Fix for issue 4: hold the readline interface reference so cleanup() can
+    // close it. Never closing it leaks an fd/handle per query in a long-running
+    // daemon. Assigned once the child stdout stream exists (below).
+    let rl: ReturnType<typeof createInterface> | undefined;
+    // Fix for issue 3: track outstanding control_request fallback timers so they
+    // are cleared on cleanup() and never leak.
+    const controlRequestTimers = new Set<NodeJS.Timeout>();
 
     const appendTextPart = (text: string) => {
       if (!text) return;
@@ -410,6 +431,11 @@ export async function claudeQuery(options: QueryOptions): Promise<QueryResult> {
         clearTimeout(forceKillTimer);
         forceKillTimer = undefined;
       }
+      // Fix for issue 3: clear any pending control_request fallback timers.
+      for (const t of controlRequestTimers) clearTimeout(t);
+      controlRequestTimers.clear();
+      // Fix for issue 4: release the readline interface bound to child.stdout.
+      if (rl) { try { rl.close(); } catch { /* ignore */ } rl = undefined; }
       cleanupTempFiles(tempImagePaths);
     };
 
@@ -437,6 +463,11 @@ export async function claudeQuery(options: QueryOptions): Promise<QueryResult> {
       }
       if (!forceKillTimer) {
         forceKillTimer = setTimeout(() => {
+          // Fix for issue 5: null the timer ref as soon as it fires so it never
+          // lingers. Any of timeout/abort/error may call this function; the first
+          // SIGTERM arms this single backstop and every path is covered by it
+          // (the child's 'close' handler -> cleanup() also clears it on exit).
+          forceKillTimer = undefined;
           if (!child || child.exitCode !== null || child.signalCode !== null) return;
           try {
             logger.warn('Claude CLI child did not exit after SIGTERM, sending SIGKILL', { reason });
@@ -553,8 +584,13 @@ export async function claudeQuery(options: QueryOptions): Promise<QueryResult> {
       stderrParts.push(chunk);
     });
     child.stderr!.on('error', (err: Error) => {
+      // Fix for issue 1: a stream error must converge the query, not just log.
+      // Otherwise the read side stalls and the query hangs until QUERY_TIMEOUT_MS.
       logger.warn('Claude CLI stderr stream errored', { message: err.message });
       if (!errorMessage) errorMessage = `Claude stderr stream error: ${err.message}`;
+      requestChildTermination('error');
+      const partialText = textParts.join('\n').trim();
+      finish({ text: partialText, sessionId, error: partialText ? undefined : errorMessage });
     });
     child.stderr!.on('close', () => {
       // Fix for issue 4: record stream shutdowns so abnormal stdout/stderr
@@ -566,10 +602,16 @@ export async function claudeQuery(options: QueryOptions): Promise<QueryResult> {
     let skillInputAccum = '';
     let trackingSkill = false;
 
-    const rl = createInterface({ input: child.stdout! });
+    rl = createInterface({ input: child.stdout! });
     child.stdout!.on('error', (err: Error) => {
+      // Fix for issue 1: terminate and settle on stdout stream error so the
+      // query returns immediately (with any partial text) instead of hanging
+      // until QUERY_TIMEOUT_MS.
       logger.warn('Claude CLI stdout stream errored', { message: err.message });
       if (!errorMessage) errorMessage = `Claude stdout stream error: ${err.message}`;
+      requestChildTermination('error');
+      const partialText = textParts.join('\n').trim();
+      finish({ text: partialText, sessionId, error: partialText ? undefined : errorMessage });
     });
     child.stdout!.on('close', () => {
       stdoutClosed = true;
@@ -591,12 +633,47 @@ export async function claudeQuery(options: QueryOptions): Promise<QueryResult> {
           if (!req || req.subtype !== 'can_use_tool') break;
           const requestId: string = obj.request_id;
 
+          // Fix for issue 3: arm a defensive fallback timer for this request and
+          // make the callback's resolution and the timeout mutually exclusive
+          // (first-to-win), so we never send two control_responses for one id.
+          let controlSettled = false;
+          let controlTimer: NodeJS.Timeout | undefined;
+
+          // Fix for issue 2: writeStdin can throw if stdin is closed/destroyed
+          // before the CLI consumes it. Wrap so a failed write only warns instead
+          // of breaking the callback Promise chain (unhandled rejection) and
+          // leaving the CLI waiting forever — the CLI ends on its own once stdin
+          // closes.
           const sendResponse = (response: any) => {
-            writeStdin(JSON.stringify({
-              type: 'control_response',
-              response: { subtype: 'success', request_id: requestId, response },
-            }) + '\n');
+            if (controlSettled) return;
+            controlSettled = true;
+            if (controlTimer) {
+              clearTimeout(controlTimer);
+              controlRequestTimers.delete(controlTimer);
+              controlTimer = undefined;
+            }
+            try {
+              writeStdin(JSON.stringify({
+                type: 'control_response',
+                response: { subtype: 'success', request_id: requestId, response },
+              }) + '\n');
+            } catch (err) {
+              logger.warn('Failed to send control_response to Claude CLI', {
+                requestId,
+                message: err instanceof Error ? err.message : String(err),
+              });
+            }
           };
+
+          // Fix for issue 3: if the upper-layer callback never settles, deny after
+          // CONTROL_REQUEST_TIMEOUT_MS (set above the main.ts 30s/5min timeouts so
+          // this is a backstop, not a pre-emption) and clean up.
+          controlTimer = setTimeout(() => {
+            controlRequestTimers.delete(controlTimer!);
+            logger.warn('control_request callback timed out, denying', { requestId, toolName: req.tool_name });
+            sendResponse({ behavior: 'deny', message: '请求超时，已自动拒绝。' });
+          }, CONTROL_REQUEST_TIMEOUT_MS);
+          controlRequestTimers.add(controlTimer);
 
           // AskUserQuestion → route to the question callback. The answer is fed
           // back as a tool result via deny+message (allow/updatedInput do NOT

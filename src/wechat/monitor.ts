@@ -190,12 +190,16 @@ function resetProcessingSessions(
 }
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, timeoutMessage: string): Promise<T> {
-  return Promise.race([
-    promise,
-    new Promise<T>((_, reject) => {
-      setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs);
-    }),
-  ]);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<T>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs);
+  });
+  // Whichever settles first wins; clear the timer afterwards so the standing
+  // setTimeout can't fire later (leaking a 30s timer per call and rejecting an
+  // already-settled, unwatched promise). `finally` runs on both resolve and reject.
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
+  });
 }
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
