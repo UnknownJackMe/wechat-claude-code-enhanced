@@ -9,7 +9,6 @@ import { logger } from '../logger.js';
 const TYPING_KEEPALIVE_MS = 5_000;
 const TYPING_REQUEST_TIMEOUT_MS = 12_000;
 const TYPING_CANCEL_TIMEOUT_MS = 3_000;
-const SEND_FILE_RATE_LIMIT_RETRY_DELAYS_MS = [500, 1_000, 2_000];
 
 export function createSender(api: WeChatApi, botAccountId: string) {
   let clientCounter = 0;
@@ -188,7 +187,7 @@ export function createSender(api: WeChatApi, botAccountId: string) {
       };
 
       logger.info('Sending file message', { toUserId, clientId, fileName: media.fileName, mediaType: media.mediaType });
-      await api.sendMessage({ msg });
+      await api.sendMessage({ msg }, { maxRetries: 1 });
       logger.info('File message sent', { toUserId, clientId, fileName: media.fileName });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -219,31 +218,11 @@ export function createSender(api: WeChatApi, botAccountId: string) {
         // Small gap between files to avoid rate limits
         if (filePaths.length > 1) await new Promise(r => setTimeout(r, 500));
       } catch (err) {
+        // sendFile already does one capped backoff internally; if it still
+        // failed, give up fast rather than stalling the channel for minutes.
         const msg = err instanceof Error ? err.message : String(err);
-        if (msg.includes('rate-limited')) {
-          let delivered = false;
-          // Small exponential retry steps handle transient per-user send throttles
-          // without turning large batches into multi-minute stalls.
-          for (const delayMs of SEND_FILE_RATE_LIMIT_RETRY_DELAYS_MS) {
-            await new Promise(r => setTimeout(r, delayMs));
-            try {
-              await sendFile(toUserId, contextToken, filePath);
-              sent++;
-              delivered = true;
-              break;
-            } catch (retryErr) {
-              const retryMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
-              if (!retryMsg.includes('rate-limited')) {
-                break;
-              }
-            }
-          }
-          if (!delivered) {
-            failed.push(filePath);
-          }
-        } else {
-          failed.push(filePath);
-        }
+        logger.warn('sendFile gave up', { filePath, error: msg });
+        failed.push(filePath);
       }
     }
 

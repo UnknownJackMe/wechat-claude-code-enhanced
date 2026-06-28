@@ -128,19 +128,26 @@ export class WeChatApi {
     );
   }
 
-  /** Send a message to a user. Per-user rate limited, retries on rate-limit (ret: -2). */
-  async sendMessage(req: SendMessageReq): Promise<void> {
+  /**
+   * Send a message to a user. Per-user rate limited, retries on rate-limit (ret: -2).
+   * `maxRetries` caps the number of backoff attempts; text uses the full budget,
+   * file sends pass a small value so a throttled file never stalls the channel.
+   */
+  async sendMessage(req: SendMessageReq, opts?: { maxRetries?: number }): Promise<void> {
     const userId = req.msg?.to_user_id;
+    const backoffs = opts?.maxRetries !== undefined
+      ? WeChatApi.RETRY_BACKOFFS_MS.slice(0, Math.max(0, opts.maxRetries))
+      : WeChatApi.RETRY_BACKOFFS_MS;
 
-    // Retry generously but finitely: one initial send plus six capped backoffs.
-    for (let attempt = 0; attempt <= WeChatApi.RETRY_BACKOFFS_MS.length; attempt++) {
+    // Retry generously but finitely: one initial send plus the capped backoffs.
+    for (let attempt = 0; attempt <= backoffs.length; attempt++) {
       await this.waitForSendSlot(userId);
       const res = await this.request<{ ret?: number }>('ilink/bot/sendmessage', req);
       if (res.ret === -2) {
-        const delay = WeChatApi.RETRY_BACKOFFS_MS[attempt];
+        const delay = backoffs[attempt];
         if (delay === undefined) {
-          logger.warn('sendMessage rate-limited after max retries', { retries: WeChatApi.RETRY_BACKOFFS_MS.length });
-          throw new Error(`sendMessage rate-limited after ${WeChatApi.RETRY_BACKOFFS_MS.length} retries`);
+          logger.warn('sendMessage rate-limited after max retries', { retries: backoffs.length });
+          throw new Error(`sendMessage rate-limited after ${backoffs.length} retries`);
         }
         logger.warn('sendMessage rate-limited (ret:-2), retrying', { attempt, delayMs: delay });
         if (userId) {

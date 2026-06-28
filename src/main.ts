@@ -1349,12 +1349,15 @@ async function sendToClaude(
         }
       }
 
+      // Do NOT auto-send file bodies: Claude usually only *mentions* paths
+      // while discussing code, and auto-sending floods + rate-limits the
+      // channel. Instead surface a lightweight hint and let the user pull
+      // the file explicitly with /send-me.
       if (pushable.length > 0) {
-        const { sent, failed: failedFiles } = await sender.sendFiles(fromUserId, contextToken, pushable);
-        if (failedFiles.length > 0) {
-          logger.error('File delivery failed after retries', { files: failedFiles });
-          await sender.sendText(fromUserId, contextToken, `文件推送失败（服务端限频），请稍后重试。`).catch(() => {});
-        }
+        const list = pushable.slice(0, 8).map(p => `  • ${p}`).join('\n');
+        const more = pushable.length > 8 ? `\n  …等 ${pushable.length} 个文件` : '';
+        const hint = `📎 回复中提到了 ${pushable.length} 个可发送文件：\n${list}${more}\n\n需要哪个发我？回复 /send-me <路径>`;
+        await sender.sendText(fromUserId, contextToken, hint).catch(() => {});
       }
     }
   } catch (err) {

@@ -5,3 +5,6 @@ dist/
 .wechat-claude-code/
 .claude/
 CLAUDE.md
+
+# macOS
+.DS_Store
